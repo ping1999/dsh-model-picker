@@ -1,5 +1,5 @@
 {
-  "name": "@sanqi-normal/dsh-model-picker",
+  "name": "dsh-model-picker",
   "description": "Enhanced model picker for the dsh web GUI: provider-tabbed left column with model list on the right, both independently scrollable, plus cross-provider search",
   "version": "1.0.0",
   "type": "module",

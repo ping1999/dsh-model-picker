@@ -20,7 +20,7 @@ A left column lists providers (independently scrollable, with model-count badges
 方式一：从 **npm registry** 安装（推荐，无 git 克隆 / prepare 脚本步骤）：
 
 ```sh
-dsh plugin --profile web add @sanqi-normal/dsh-model-picker
+dsh plugin --profile web add dsh-model-picker
 ```
 
 方式二：从 GitHub 源码安装：
