@@ -56,7 +56,7 @@ After the web server restarts, open any session and click the model selector at 
 持久化 bundle（`package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml`），由 `dsh plugin add` 的 reconcile 自动加入 profile 的 `dsh.profile.bundles` 层：
 
 - **Client 半**（`lib/client.js`）：通过 `exports["./client"]` + `dsh.client` 声明被 web 前端加载，注册到 composer 的 `conversation.input.model` 座位（priority -1，顶替默认实现）；数据复用内置 `ui-model-selection` 的 `ctx.modelDirectories` 每会话目录（`session.models` / `session.selectModel`），不引入第二份状态
-- 纯客户端插件，无 Host 半区，无网络请求，无持久化状态
+- **Host 半**（`lib/host.js`）：空实现——Node 侧 loader 以包根入口导入它（浏览器专属的 `lib/client.js` 必须只在 `./client` 导出下被 web 端加载），无网络请求、无持久化状态
 
 ## 要求与限制 Requirements and limitations
 
