@@ -22,7 +22,8 @@ const dirStore = {
   }),
 }
 
-function makeCtx(reg) {
+function makeCtx(reg, store) {
+  const directoryStore = store === undefined ? dirStore : store
   return {
     get(name) {
       if (name === 'slots') {
@@ -32,13 +33,35 @@ function makeCtx(reg) {
         }
       }
       if (name === 'modelDirectories') {
-        return { directoryFor: () => ({ store: dirStore, load: () => {}, select: () => Promise.resolve() }) }
+        return { directoryFor: () => ({ store: directoryStore, load: () => {}, select: () => Promise.resolve() }) }
       }
       if (name === 'sessions') return { subagentAddress: () => undefined }
       return undefined
     },
     effect(fn) { return fn() },
   }
+}
+
+// Depth-first search the fake createElement tree for a node whose props carry
+// the given class token.
+function findByClass(node, cls) {
+  if (node === null || node === undefined || typeof node !== 'object') return null
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findByClass(child, cls)
+      if (found !== null) return found
+    }
+    return null
+  }
+  if (node.tag !== 'el') return null
+  const props = node.args[1]
+  if (props !== null && typeof props === 'object'
+    && String(props.className ?? '').split(' ').includes(cls)) return node
+  for (const child of node.args.slice(2)) {
+    const found = findByClass(child, cls)
+    if (found !== null) return found
+  }
+  return null
 }
 
 function makeReact(stateQueue) {
@@ -172,4 +195,82 @@ let loaded = null
   const tree = reg.value.Component({ locked: false, ...face })
   if (tree !== null) { console.error('FAIL: unavailable seat should render null'); process.exit(1) }
   console.log('PASS fallback path (no modelDirectories) renders null')
+}
+
+// --- Refresh keeps the cached list visible (stale-while-revalidate) ---
+// Regression guard for the slow-open fix: with status 'loading' and previously
+// loaded groups the right pane must keep rendering the list (the platform store
+// preserves groups across reloads), not collapse into the bare "loading" status
+// on every open.
+{
+  const refreshingStore = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({
+      current: { provider: 'p1', model: 'm1' },
+      routable: true,
+      groups: [
+        { id: 'p1', name: 'DeepSeek', models: [{ id: 'm1', name: 'deepseek-v4-flash', description: 'Fast' }] },
+      ],
+      failures: [],
+      status: 'loading',
+      error: null,
+    }),
+  }
+  const reg = { value: null }
+  const ctx = makeCtx(reg, refreshingStore)
+  const stateQueue = [true, '', null, null] // open, query, activeProvider, notice
+  const require = (spec) => {
+    if (spec === 'react') return makeReact(stateQueue)
+    throw new Error('unexpected require: ' + spec)
+  }
+  new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')(require)
+  const mod = loaded.factory(require)
+  mod.apply(ctx)
+  const face = reg.value.opts.inject('sess-1')
+  const tree = reg.value.Component({ locked: false, ...face })
+  const list = findByClass(tree, 'dsh-mp-list')
+  if (!list) { console.error('FAIL: dsh-mp-list not rendered'); process.exit(1) }
+  const child = list.args[2]
+  if (!child || child.tag !== 'el' || child.args[0] !== 'fragment') {
+    console.error('FAIL: loading with cached groups must keep rendering the list branch')
+    process.exit(1)
+  }
+  if (!findByClass(tree, 'dsh-mp-status')) {
+    console.error('FAIL: refreshing hint missing while loading with cached groups'); process.exit(1)
+  }
+  if (!findByClass(tree, 'dsh-mp-option')) {
+    console.error('FAIL: cached models not rendered during refresh'); process.exit(1)
+  }
+  console.log('PASS refresh with cached groups keeps the list visible (stale-while-revalidate)')
+}
+
+// --- First load (no cached groups) keeps the full-pane loading status ---
+{
+  const firstLoadStore = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({
+      current: null, routable: null, groups: [], failures: [], status: 'loading', error: null,
+    }),
+  }
+  const reg = { value: null }
+  const ctx = makeCtx(reg, firstLoadStore)
+  const stateQueue = [true, '', null, null]
+  const require = (spec) => {
+    if (spec === 'react') return makeReact(stateQueue)
+    throw new Error('unexpected require: ' + spec)
+  }
+  new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')(require)
+  const mod = loaded.factory(require)
+  mod.apply(ctx)
+  const face = reg.value.opts.inject('sess-1')
+  const tree = reg.value.Component({ locked: false, ...face })
+  const list = findByClass(tree, 'dsh-mp-list')
+  if (!list) { console.error('FAIL: dsh-mp-list not rendered'); process.exit(1) }
+  const child = list.args[2]
+  if (!child || child.tag !== 'el' || child.args[0] !== 'div'
+    || !String((child.args[1] && child.args[1].className) ?? '').split(' ').includes('dsh-mp-status')) {
+    console.error('FAIL: first load with no groups should show the full-pane loading status')
+    process.exit(1)
+  }
+  console.log('PASS first load with empty groups shows the loading status')
 }

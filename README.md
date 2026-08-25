@@ -10,10 +10,11 @@ An enhanced model picker for the dsh web GUI: a **left provider column with the 
 - 默认选中当前模型所属的提供商；点击任意提供商即切换
 - 顶部搜索框跨提供商匹配（提供商名 / 模型名 / 描述，大小写不敏感），结果带提供商名，点选即切换
 - 保留推理档位切换（当前模型支持时显示在底部）、加载 / 错误 / 重试 / 空态
+- 打开面板即显示已缓存的模型列表、后台刷新不遮挡（stale-while-revalidate）；仅首次加载显示整屏加载态
 - 与内置 `/model` 弹层共享同一份模型目录（`ctx.modelDirectories`），任何一处切换另一处立即同步；composer 的模型阻塞逻辑不受影响
 - 界面跟随系统深浅色主题；文案中英文自动切换
 
-A left column lists providers (independently scrollable, with model-count badges); the right column shows the active provider's models (independently scrollable). The search box matches across providers (provider name / model name / description, case-insensitive). Reasoning-effort switching, loading/error/retry/empty states are preserved, and the panel shares the same per-session model directory as the built-in `/model` popup. Dark/light theme aware; UI text follows the system language.
+A left column lists providers (independently scrollable, with model-count badges); the right column shows the active provider's models (independently scrollable). The search box matches across providers (provider name / model name / description, case-insensitive). Reasoning-effort switching, loading/error/retry/empty states are preserved, and the panel shares the same per-session model directory as the built-in `/model` popup. Reopening the panel shows the cached list immediately and refreshes in the background (stale-while-revalidate); only the very first load shows a full loading state. Dark/light theme aware; UI text follows the system language.
 
 ## 安装 Install
 
