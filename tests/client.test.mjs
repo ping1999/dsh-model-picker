@@ -150,7 +150,7 @@ let loaded = null
 {
   const reg = { value: null }
   const ctx = makeCtx(reg)
-  const stateQueue = [true, '', null, null] // open, query, activeProvider, notice
+  const stateQueue = ['models', '', null, null] // pane, query, activeProvider, notice
   const require = (spec) => {
     if (spec === 'react') return makeReact(stateQueue)
     throw new Error('unexpected require: ' + spec)
@@ -162,7 +162,10 @@ let loaded = null
   try {
     const tree = reg.value.Component({ locked: false, ...face })
     if (!tree || tree.tag !== 'el') throw new Error('unexpected tree ' + JSON.stringify(tree))
-    console.log('PASS open-menu render smoke (left providers + right list)')
+    if (findByClass(tree, 'dsh-mp-effortTrigger')) {
+      console.error('FAIL: effort trigger should stay hidden when the model has no reasoning'); process.exit(1)
+    }
+    console.log('PASS open-menu render smoke (left providers + right list, effort trigger hidden)')
   } catch (e) {
     console.error('FAIL open-menu render: ' + String((e && e.stack) || e)); process.exit(1)
   }
@@ -197,11 +200,11 @@ let loaded = null
   console.log('PASS fallback path (no modelDirectories) renders null')
 }
 
-// --- Refresh keeps the cached list visible (stale-while-revalidate) ---
-// Regression guard for the slow-open fix: with status 'loading' and previously
-// loaded groups the right pane must keep rendering the list (the platform store
-// preserves groups across reloads), not collapse into the bare "loading" status
-// on every open.
+// --- Refresh with cached groups: list stays, and NO loading hint ---
+// Regression guard for the instant-open change: with status 'loading' and
+// previously loaded groups the right pane must keep rendering the cached list
+// WITHOUT any "loading" row — revalidation is invisible; the full-pane
+// loading status is reserved for the first load (empty groups).
 {
   const refreshingStore = {
     subscribe: () => () => {},
@@ -218,7 +221,7 @@ let loaded = null
   }
   const reg = { value: null }
   const ctx = makeCtx(reg, refreshingStore)
-  const stateQueue = [true, '', null, null] // open, query, activeProvider, notice
+  const stateQueue = ['models', '', null, null] // pane, query, activeProvider, notice
   const require = (spec) => {
     if (spec === 'react') return makeReact(stateQueue)
     throw new Error('unexpected require: ' + spec)
@@ -235,13 +238,13 @@ let loaded = null
     console.error('FAIL: loading with cached groups must keep rendering the list branch')
     process.exit(1)
   }
-  if (!findByClass(tree, 'dsh-mp-status')) {
-    console.error('FAIL: refreshing hint missing while loading with cached groups'); process.exit(1)
+  if (findByClass(tree, 'dsh-mp-status')) {
+    console.error('FAIL: silent revalidate must not show a loading row over cached groups'); process.exit(1)
   }
   if (!findByClass(tree, 'dsh-mp-option')) {
     console.error('FAIL: cached models not rendered during refresh'); process.exit(1)
   }
-  console.log('PASS refresh with cached groups keeps the list visible (stale-while-revalidate)')
+  console.log('PASS refresh with cached groups keeps the list visible with no loading row')
 }
 
 // --- First load (no cached groups) keeps the full-pane loading status ---
@@ -254,7 +257,7 @@ let loaded = null
   }
   const reg = { value: null }
   const ctx = makeCtx(reg, firstLoadStore)
-  const stateQueue = [true, '', null, null]
+  const stateQueue = ['models', '', null, null] // pane, query, activeProvider, notice
   const require = (spec) => {
     if (spec === 'react') return makeReact(stateQueue)
     throw new Error('unexpected require: ' + spec)
@@ -273,4 +276,77 @@ let loaded = null
     process.exit(1)
   }
   console.log('PASS first load with empty groups shows the loading status')
+}
+
+// --- Reasoning effort gets its own trigger right of the model trigger ---
+// The model whose directory entry carries `reasoning` must render a second
+// pill next to the model trigger; clicking it opens the narrow effort menu
+// instead of the provider/model pane.
+{
+  const reasoningStore = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({
+      current: { provider: 'p1', model: 'm1', reasoningEffort: 'max' },
+      routable: true,
+      groups: [
+        {
+          id: 'p1',
+          name: 'DeepSeek',
+          models: [{
+            id: 'm1',
+            name: 'deepseek-v4-pro',
+            reasoning: { efforts: [{ id: 'off', name: 'Off' }, { id: 'max', name: 'Max', description: 'Max effort' }] },
+          }],
+        },
+      ],
+      failures: [],
+      status: 'ready',
+      error: null,
+    }),
+  }
+  // Closed: effort trigger rendered, both menus hidden.
+  {
+    const reg = { value: null }
+    const ctx = makeCtx(reg, reasoningStore)
+    const require = (spec) => {
+      if (spec === 'react') return makeReact(null)
+      throw new Error('unexpected require: ' + spec)
+    }
+    new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')(require)
+    const mod = loaded.factory(require)
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    const tree = reg.value.Component({ locked: false, ...face })
+    if (!findByClass(tree, 'dsh-mp-effortTrigger')) {
+      console.error('FAIL: effort trigger missing for a reasoning model'); process.exit(1)
+    }
+    if (findByClass(tree, 'dsh-mp-menuEffort') || findByClass(tree, 'dsh-mp-providers')) {
+      console.error('FAIL: menus should stay hidden while closed'); process.exit(1)
+    }
+    console.log('PASS effort trigger renders beside the model trigger (closed)')
+  }
+  // Open on the effort pane: the effort option list shows, model pane does not.
+  {
+    const reg = { value: null }
+    const ctx = makeCtx(reg, reasoningStore)
+    const stateQueue = ['effort', '', null, null] // pane, query, activeProvider, notice
+    const require = (spec) => {
+      if (spec === 'react') return makeReact(stateQueue)
+      throw new Error('unexpected require: ' + spec)
+    }
+    new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')(require)
+    const mod = loaded.factory(require)
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    const tree = reg.value.Component({ locked: false, ...face })
+    const menu = findByClass(tree, 'dsh-mp-menuEffort')
+    if (!menu) { console.error('FAIL: effort menu not rendered'); process.exit(1) }
+    if (!findByClass(menu, 'dsh-mp-option')) {
+      console.error('FAIL: effort options missing from the effort menu'); process.exit(1)
+    }
+    if (findByClass(tree, 'dsh-mp-providers')) {
+      console.error('FAIL: model pane should not render while the effort pane is open'); process.exit(1)
+    }
+    console.log('PASS effort pane renders the effort options')
+  }
 }

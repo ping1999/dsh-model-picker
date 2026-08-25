@@ -9,12 +9,12 @@ An enhanced model picker for the dsh web GUI: a **left provider column with the 
 - 左栏按提供商纵向排列（独立滚动，带模型计数徽章），右栏显示当前提供商的模型（独立滚动）——几十个提供商、上百个模型也能顺畅浏览
 - 默认选中当前模型所属的提供商；点击任意提供商即切换
 - 顶部搜索框跨提供商匹配（提供商名 / 模型名 / 描述，大小写不敏感），结果带提供商名，点选即切换
-- 保留推理档位切换（当前模型支持时显示在底部）、加载 / 错误 / 重试 / 空态
-- 打开面板即显示已缓存的模型列表、后台刷新不遮挡（stale-while-revalidate）；仅首次加载显示整屏加载态
+- 推理档位独立为模型按钮右侧的第二个按钮（当前模型支持时显示，含「提供方默认」），点击弹出窄菜单切换；加载 / 错误 / 重试 / 空态保留
+- 打开面板瞬时渲染：60 秒内有缓存则完全不发 RPC；过期或出错才后台刷新，且刷新过程不显示任何加载行（静默 revalidate）；仅首次加载显示整屏加载态
 - 与内置 `/model` 弹层共享同一份模型目录（`ctx.modelDirectories`），任何一处切换另一处立即同步；composer 的模型阻塞逻辑不受影响
 - 界面跟随系统深浅色主题；文案中英文自动切换
 
-A left column lists providers (independently scrollable, with model-count badges); the right column shows the active provider's models (independently scrollable). The search box matches across providers (provider name / model name / description, case-insensitive). Reasoning-effort switching, loading/error/retry/empty states are preserved, and the panel shares the same per-session model directory as the built-in `/model` popup. Reopening the panel shows the cached list immediately and refreshes in the background (stale-while-revalidate); only the very first load shows a full loading state. Dark/light theme aware; UI text follows the system language.
+A left column lists providers (independently scrollable, with model-count badges); the right column shows the active provider's models (independently scrollable). The search box matches across providers (provider name / model name / description, case-insensitive). Reasoning effort gets its own trigger button immediately right of the model trigger (shown when the current model supports it, including a "provider default" entry), opening a compact effort menu; loading/error/retry/empty states are preserved, and the panel shares the same per-session model directory as the built-in `/model` popup. Opening the panel renders instantly from the cached list — no RPC at all within a 60-second freshness window, and any background revalidation never shows a loading row; only the very first load shows a full loading state. Dark/light theme aware; UI text follows the system language.
 
 ## 安装 Install
 
@@ -44,13 +44,13 @@ GitHub 源安装会执行包内 prepare 脚本，如被 pnpm 拦截，把提示�
 
 - 左栏点击提供商切换右侧模型列表；右栏点击模型即选中（✓ 标记当前模型）
 - 顶部输入关键词，右栏切换为跨提供商搜索结果；点击左侧任意提供商即退出搜索并切换
-- 当前模型支持推理档位时，菜单底部出现档位按钮（含「提供方默认」）
+- 当前模型支持推理档位时，模型按钮右侧出现档位按钮（含「提供方默认」），点击弹出窄菜单切换
 
 After the web server restarts, open any session and click the model selector at the right end of the composer tool row:
 
 - Click a provider in the left column to switch the right list; click a model to select it (✓ marks the current one)
 - Type in the search box to see cross-provider results; clicking any provider exits search
-- When the current model supports reasoning efforts, effort buttons (including "provider default") appear at the bottom of the menu
+- When the current model supports reasoning efforts, an effort pill (including "provider default") appears right of the model trigger; click it to open a compact effort menu
 
 ## 工作原理 How it works
 
