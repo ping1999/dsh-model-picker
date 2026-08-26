@@ -71,6 +71,21 @@ function findByClass(node, cls) {
   return null
 }
 
+// Same DFS, but collects every match (findByClass stops at the first).
+function findAllByClass(node, cls, out = []) {
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  if (Array.isArray(node)) {
+    for (const child of node) findAllByClass(child, cls, out)
+    return out
+  }
+  if (node.tag !== 'el') return out
+  const props = node.args[1]
+  if (props !== null && typeof props === 'object'
+    && String(props.className ?? '').split(' ').includes(cls)) out.push(node)
+  for (const child of node.args.slice(2)) findAllByClass(child, cls, out)
+  return out
+}
+
 function makeReact(stateQueue) {
   let hookIndex = 0
   return {
@@ -557,4 +572,148 @@ let loaded = null
     console.error('FAIL: the "no models" placeholder must never replace hydrated data'); process.exit(1)
   }
   console.log('PASS empty RPC response never downgrades a hydrated catalog')
+}
+
+// --- Clicking a model fires select synchronously with the right payload ---
+// Wiring guard for the optimistic switch: the click must call select
+// immediately (the menu close / label move are React state, untestable with
+// the stub) and carry exactly the selection the host expects.
+{
+  const selections = []
+  globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} }
+  const clickDir = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({
+      current: { provider: 'p1', model: 'm1' },
+      routable: true,
+      groups: [
+        { id: 'p1', name: 'DeepSeek', models: [{ id: 'm1', name: 'deepseek-v4-flash' }] },
+        { id: 'p2', name: 'OpenAI', models: [{ id: 'm2', name: 'gpt-5' }] },
+      ],
+      failures: [],
+      status: 'ready',
+      error: null,
+    }),
+  }
+  const reg = { value: null }
+  const ctx = {
+    get(name) {
+      if (name === 'slots') {
+        return {
+          inject(key, cb) { if (key === 'conversation.input.model') reg.value = cb() },
+          register(opts, Component) { return { opts, Component } },
+        }
+      }
+      if (name === 'connection') return { api: { llm: { models: () => new Promise(() => {}) } } }
+      if (name === 'remote') return { $on: () => {} }
+      if (name === 'modelDirectories') {
+        return {
+          directoryFor: () => ({
+            store: clickDir,
+            load: () => {},
+            select: (s) => { selections.push(s); return Promise.resolve() },
+          }),
+        }
+      }
+      if (name === 'sessions') return { subagentAddress: () => undefined }
+      return undefined
+    },
+    effect(fn) { return fn() },
+    on() {},
+  }
+  const stateQueue = ['models', 'gpt', null, null] // open menu, searching "gpt" -> only p2/m2
+  const require = (spec) => {
+    if (spec === 'react') return makeReact(stateQueue)
+    throw new Error('unexpected require: ' + spec)
+  }
+  new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')(require)
+  const mod = loaded.factory(require)
+  mod.apply(ctx)
+  const face = reg.value.opts.inject('sess-1')
+  const tree = reg.value.Component({ locked: false, ...face })
+  const options = findAllByClass(tree, 'dsh-mp-option')
+  if (options.length !== 1) {
+    console.error('FAIL: expected exactly one search result, got ' + options.length); process.exit(1)
+  }
+  options[0].args[1].onClick()
+  if (selections.length !== 1 || selections[0].provider !== 'p2' || selections[0].model !== 'm2'
+    || selections[0].reasoningEffort !== undefined) {
+    console.error('FAIL: select not fired synchronously with the right payload: ' + JSON.stringify(selections))
+    process.exit(1)
+  }
+  console.log('PASS clicking a search result fires select immediately with the right payload')
+}
+
+// --- Clicking an effort option fires select with the reasoningEffort ---
+{
+  const selections = []
+  globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} }
+  const reasoningDir = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({
+      current: { provider: 'p1', model: 'm1', reasoningEffort: 'max' },
+      routable: true,
+      groups: [
+        {
+          id: 'p1',
+          name: 'DeepSeek',
+          models: [{
+            id: 'm1',
+            name: 'deepseek-v4-pro',
+            reasoning: { efforts: [{ id: 'off', name: 'Off' }, { id: 'max', name: 'Max', description: 'Max effort' }] },
+          }],
+        },
+      ],
+      failures: [],
+      status: 'ready',
+      error: null,
+    }),
+  }
+  const reg = { value: null }
+  const ctx = {
+    get(name) {
+      if (name === 'slots') {
+        return {
+          inject(key, cb) { if (key === 'conversation.input.model') reg.value = cb() },
+          register(opts, Component) { return { opts, Component } },
+        }
+      }
+      if (name === 'connection') return { api: { llm: { models: () => new Promise(() => {}) } } }
+      if (name === 'remote') return { $on: () => {} }
+      if (name === 'modelDirectories') {
+        return {
+          directoryFor: () => ({
+            store: reasoningDir,
+            load: () => {},
+            select: (s) => { selections.push(s); return Promise.resolve() },
+          }),
+        }
+      }
+      if (name === 'sessions') return { subagentAddress: () => undefined }
+      return undefined
+    },
+    effect(fn) { return fn() },
+    on() {},
+  }
+  const stateQueue = ['effort', '', null, null] // effort pane open
+  const require = (spec) => {
+    if (spec === 'react') return makeReact(stateQueue)
+    throw new Error('unexpected require: ' + spec)
+  }
+  new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')(require)
+  const mod = loaded.factory(require)
+  mod.apply(ctx)
+  const face = reg.value.opts.inject('sess-1')
+  const tree = reg.value.Component({ locked: false, ...face })
+  // Effort rows: 提供方默认, Off, Max (current). Click "Off".
+  const options = findAllByClass(tree, 'dsh-mp-option')
+  if (options.length !== 3) {
+    console.error('FAIL: expected 3 effort rows, got ' + options.length); process.exit(1)
+  }
+  options[1].args[1].onClick()
+  if (selections.length !== 1 || selections[0].provider !== 'p1' || selections[0].model !== 'm1'
+    || selections[0].reasoningEffort !== 'off') {
+    console.error('FAIL: effort select payload wrong: ' + JSON.stringify(selections)); process.exit(1)
+  }
+  console.log('PASS clicking an effort option fires select with the reasoningEffort')
 }
