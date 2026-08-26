@@ -359,10 +359,11 @@ let loaded = null
   }
 }
 
-// --- Boot prefetch warms the global catalog; push events revalidate it ---
-// The root-scope catalog store must issue exactly one llm.models call at
-// apply() time (dsh.client.immediately loads the bundle at startup), persist
-// the snapshot to localStorage on success, and reload on each push event.
+// --- Boot warmup is delayed; push events revalidate through a debounce ---
+// Startup-cost regression guard: apply() must NOT fire an RPC eagerly (the
+// fan-out can include a live provider fetch). The warmup lands after
+// BOOT_WARMUP_DELAY (3s), persists the snapshot, and each push event triggers
+// one debounced (1.2s) reload.
 {
   let calls = 0
   const writes = []
@@ -410,10 +411,12 @@ let loaded = null
   new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')(require)
   const mod = loaded.factory(require)
   mod.apply(ctx)
-  if (calls !== 1) {
-    console.error('FAIL: boot prefetch should issue exactly one llm.models call, got ' + calls); process.exit(1)
+  if (calls !== 0) {
+    console.error('FAIL: apply() must not issue an eager llm.models call on the startup path, got ' + calls)
+    process.exit(1)
   }
-  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 3300))
+  if (calls !== 1) { console.error('FAIL: boot warmup should fire once, got ' + calls); process.exit(1) }
   if (!writes.some(([key]) => key === 'dsh-model-picker:catalog:v1')) {
     console.error('FAIL: a successful load should persist the catalog snapshot'); process.exit(1)
   }
@@ -421,11 +424,13 @@ let loaded = null
     console.error('FAIL: push events not subscribed'); process.exit(1)
   }
   handlers['llm/adapters-updated']()
+  if (calls !== 1) { console.error('FAIL: push events must be debounced, calls=' + calls); process.exit(1) }
+  await new Promise((resolve) => setTimeout(resolve, 1500))
   if (calls !== 2) { console.error('FAIL: adapters-updated should revalidate, calls=' + calls); process.exit(1) }
-  await new Promise((resolve) => setTimeout(resolve, 0))
   handlers['settings/document-updated']()
+  await new Promise((resolve) => setTimeout(resolve, 1500))
   if (calls !== 3) { console.error('FAIL: document-updated should revalidate, calls=' + calls); process.exit(1) }
-  console.log('PASS boot prefetch + localStorage persist + push-event revalidation')
+  console.log('PASS delayed boot warmup + localStorage persist + debounced push-event revalidation')
 }
 
 // --- Hydrated catalog paints instantly, even with an empty directory ---
@@ -467,4 +472,89 @@ let loaded = null
     console.error('FAIL: hydrated catalog must not show a loading row'); process.exit(1)
   }
   console.log('PASS hydrated catalog renders cached models with an empty directory')
+}
+
+// --- Empty RPC response never downgrades a hydrated catalog ---
+// Regression guard for the boot race: right after a web restart the host can
+// answer llm.models with { groups: [] } before adapters finish registering.
+// That empty answer must NOT clear the localStorage-hydrated list (the flash
+// to "暂无可用模型"), must not be persisted, and the revalidation must stay
+// invisible (no loading row over the cached groups).
+{
+  const stored = {
+    v: 1,
+    at: Date.now(),
+    groups: [{ id: 'p9', name: 'Cached', models: [{ id: 'm9', name: 'cached-model', description: 'from disk' }] }],
+    failures: [],
+  }
+  const writes = []
+  const handlers = {}
+  let calls = 0
+  globalThis.localStorage = {
+    getItem: (key) => (key === 'dsh-model-picker:catalog:v1' ? JSON.stringify(stored) : null),
+    setItem: (k, v) => { writes.push([k, v]) },
+    removeItem: () => {},
+  }
+  const emptyDir = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
+  }
+  const reg = { value: null }
+  const ctx = {
+    get(name) {
+      if (name === 'slots') {
+        return {
+          inject(key, cb) { if (key === 'conversation.input.model') reg.value = cb() },
+          register(opts, Component) { return { opts, Component } },
+        }
+      }
+      if (name === 'connection') {
+        return {
+          api: {
+            llm: {
+              // The boot-race answer: success, but zero groups.
+              models: () => { calls += 1; return Promise.resolve({ groups: [], failures: [] }) },
+            },
+          },
+        }
+      }
+      if (name === 'remote') return { $on: (event, fn) => { handlers[event] = fn } }
+      if (name === 'modelDirectories') {
+        return { directoryFor: () => ({ store: emptyDir, load: () => {}, select: () => Promise.resolve() }) }
+      }
+      if (name === 'sessions') return { subagentAddress: () => undefined }
+      return undefined
+    },
+    effect(fn) { return fn() },
+    on() {},
+  }
+  const stateQueue = ['models', '', null, null] // pane, query, activeProvider, notice
+  const require = (spec) => {
+    if (spec === 'react') return makeReact(stateQueue)
+    throw new Error('unexpected require: ' + spec)
+  }
+  new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')(require)
+  const mod = loaded.factory(require)
+  mod.apply(ctx)
+  // Simulate the push event storm; the debounced reload answers empty.
+  handlers['llm/adapters-updated']()
+  await new Promise((resolve) => setTimeout(resolve, 1600)) // past the 1.2s debounce
+  if (calls !== 1) {
+    console.error('FAIL: debounced revalidation should have fired exactly once, got ' + calls); process.exit(1)
+  }
+  if (writes.length !== 0) {
+    console.error('FAIL: an empty response must never be persisted over a good cache'); process.exit(1)
+  }
+  const face = reg.value.opts.inject('sess-1')
+  const tree = reg.value.Component({ locked: false, ...face })
+  if (!findByClass(tree, 'dsh-mp-option')) {
+    console.error('FAIL: empty response must not clear the hydrated model list'); process.exit(1)
+  }
+  if (findByClass(tree, 'dsh-mp-status')) {
+    console.error('FAIL: background revalidation must stay invisible over hydrated groups'); process.exit(1)
+  }
+  if (findByClass(tree, 'dsh-mp-empty')) {
+    console.error('FAIL: the "no models" placeholder must never replace hydrated data'); process.exit(1)
+  }
+  console.log('PASS empty RPC response never downgrades a hydrated catalog')
 }
