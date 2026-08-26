@@ -32,6 +32,12 @@ function makeCtx(reg, store) {
           register(opts, Component) { return { opts, Component } },
         }
       }
+      if (name === 'connection') {
+        // Never resolves: the catalog stays empty/loading so the per-session
+        // directory snapshot drives the list in these tests.
+        return { api: { llm: { models: () => new Promise(() => {}) } } }
+      }
+      if (name === 'remote') return { $on: () => {} }
       if (name === 'modelDirectories') {
         return { directoryFor: () => ({ store: directoryStore, load: () => {}, select: () => Promise.resolve() }) }
       }
@@ -39,6 +45,7 @@ function makeCtx(reg, store) {
       return undefined
     },
     effect(fn) { return fn() },
+    on() {},
   }
 }
 
@@ -91,6 +98,7 @@ let loaded = null
     getElementById: () => null,
     createElement: () => ({ remove: () => {} }),
   }
+  globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} }
   Object.defineProperty(globalThis, 'navigator', { value: { language: 'zh-CN' }, configurable: true })
 
   const require = (spec) => {
@@ -107,7 +115,7 @@ let loaded = null
   if (!mod || !Array.isArray(mod.inject) || typeof mod.apply !== 'function') {
     console.error('FAIL: bad module shape'); process.exit(1)
   }
-  if (mod.inject.join(',') !== 'slots') { console.error('FAIL: inject=' + mod.inject); process.exit(1) }
+  if (mod.inject.join(',') !== 'slots,connection,remote') { console.error('FAIL: inject=' + mod.inject); process.exit(1) }
 
   mod.apply(ctx)
   if (!reg.value) { console.error('FAIL: seat not registered'); process.exit(1) }
@@ -349,4 +357,114 @@ let loaded = null
     }
     console.log('PASS effort pane renders the effort options')
   }
+}
+
+// --- Boot prefetch warms the global catalog; push events revalidate it ---
+// The root-scope catalog store must issue exactly one llm.models call at
+// apply() time (dsh.client.immediately loads the bundle at startup), persist
+// the snapshot to localStorage on success, and reload on each push event.
+{
+  let calls = 0
+  const writes = []
+  const handlers = {}
+  const reg = { value: null }
+  globalThis.localStorage = {
+    getItem: () => null,
+    setItem: (k, v) => { writes.push([k, v]) },
+    removeItem: () => {},
+  }
+  const ctx = {
+    get(name) {
+      if (name === 'slots') {
+        return {
+          inject(key, cb) { if (key === 'conversation.input.model') reg.value = cb() },
+          register(opts, Component) { return { opts, Component } },
+        }
+      }
+      if (name === 'connection') {
+        return {
+          api: {
+            llm: {
+              models: () => {
+                calls += 1
+                return Promise.resolve({ groups: [{ id: 'p1', name: 'DeepSeek', models: [] }], failures: [] })
+              },
+            },
+          },
+        }
+      }
+      if (name === 'remote') return { $on: (event, fn) => { handlers[event] = fn } }
+      if (name === 'modelDirectories') {
+        return { directoryFor: () => ({ store: dirStore, load: () => {}, select: () => Promise.resolve() }) }
+      }
+      if (name === 'sessions') return { subagentAddress: () => undefined }
+      return undefined
+    },
+    effect(fn) { return fn() },
+    on() {},
+  }
+  const require = (spec) => {
+    if (spec === 'react') return makeReact(null)
+    throw new Error('unexpected require: ' + spec)
+  }
+  new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')(require)
+  const mod = loaded.factory(require)
+  mod.apply(ctx)
+  if (calls !== 1) {
+    console.error('FAIL: boot prefetch should issue exactly one llm.models call, got ' + calls); process.exit(1)
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  if (!writes.some(([key]) => key === 'dsh-model-picker:catalog:v1')) {
+    console.error('FAIL: a successful load should persist the catalog snapshot'); process.exit(1)
+  }
+  if (typeof handlers['llm/adapters-updated'] !== 'function' || typeof handlers['settings/document-updated'] !== 'function') {
+    console.error('FAIL: push events not subscribed'); process.exit(1)
+  }
+  handlers['llm/adapters-updated']()
+  if (calls !== 2) { console.error('FAIL: adapters-updated should revalidate, calls=' + calls); process.exit(1) }
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  handlers['settings/document-updated']()
+  if (calls !== 3) { console.error('FAIL: document-updated should revalidate, calls=' + calls); process.exit(1) }
+  console.log('PASS boot prefetch + localStorage persist + push-event revalidation')
+}
+
+// --- Hydrated catalog paints instantly, even with an empty directory ---
+// Regression guard for the disk-cache path: a localStorage-hydrated catalog
+// must render the cached models on the very first frame — no loading row —
+// even when the per-session directory has not loaded anything yet.
+{
+  const stored = {
+    v: 1,
+    at: Date.now(),
+    groups: [{ id: 'p9', name: 'Cached', models: [{ id: 'm9', name: 'cached-model', description: 'from disk' }] }],
+    failures: [],
+  }
+  globalThis.localStorage = {
+    getItem: (key) => (key === 'dsh-model-picker:catalog:v1' ? JSON.stringify(stored) : null),
+    setItem: () => {},
+    removeItem: () => {},
+  }
+  const emptyDir = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
+  }
+  const reg = { value: null }
+  const ctx = makeCtx(reg, emptyDir)
+  const stateQueue = ['models', '', null, null] // pane, query, activeProvider, notice
+  const require = (spec) => {
+    if (spec === 'react') return makeReact(stateQueue)
+    throw new Error('unexpected require: ' + spec)
+  }
+  new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')(require)
+  const mod = loaded.factory(require)
+  mod.apply(ctx)
+  const face = reg.value.opts.inject('sess-1')
+  const tree = reg.value.Component({ locked: false, ...face })
+  if (!findByClass(tree, 'dsh-mp-option')) {
+    console.error('FAIL: hydrated catalog should render the cached models immediately'); process.exit(1)
+  }
+  if (findByClass(tree, 'dsh-mp-status')) {
+    console.error('FAIL: hydrated catalog must not show a loading row'); process.exit(1)
+  }
+  console.log('PASS hydrated catalog renders cached models with an empty directory')
 }

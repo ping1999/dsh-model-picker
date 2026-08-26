@@ -1,7 +1,7 @@
 {
   "name": "dsh-model-picker",
   "description": "Enhanced model picker for the dsh web GUI: provider-tabbed left column with model list on the right, both independently scrollable, plus cross-provider search",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "main": "lib/host.js",
   "exports": {
@@ -45,7 +45,8 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "platform": "web"
+      "platform": "web",
+      "immediately": true
     }
   },
   "peerDependencies": {
