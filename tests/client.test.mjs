@@ -132,6 +132,8 @@ function makeReact(stateQueue, setCalls) {
     useMemo: (fn) => fn(),
     useCallback: (fn) => fn,
     useSyncExternalStore: (_sub, get) => get(),
+    // Mimics React 18 useId; the client sanitizes it into the id base.
+    useId: () => ':r0:',
     Fragment: 'fragment',
   }
 }
@@ -240,10 +242,11 @@ function loadClient(stateQueue, setCalls) {
     if (findByClass(tree, 'dsh-mp-effortTrigger')) {
       console.error('FAIL: effort trigger should stay hidden when the model has no reasoning'); process.exit(1)
     }
-    // Right column: a listbox with the active provider's options.
+    // Right column: a listbox with the active provider's options. Ids are
+    // namespaced by the useId base (':r0:' sanitized to 'r0' by the stub).
     const list = findByClass(tree, 'dsh-mp-list')
-    if (!list || list.args[1].role !== 'listbox' || list.args[1].id !== 'dsh-mp-listbox') {
-      console.error('FAIL: right column must be the dsh-mp-listbox listbox'); process.exit(1)
+    if (!list || list.args[1].role !== 'listbox' || list.args[1].id !== 'dsh-mp-r0-listbox') {
+      console.error('FAIL: right column must be the instance-scoped listbox'); process.exit(1)
     }
     const options = findAllByClass(list, 'dsh-mp-option')
     if (options.length !== 1) {
@@ -255,7 +258,7 @@ function loadClient(stateQueue, setCalls) {
     // The search input is the combobox controlling that listbox.
     const search = findByClass(tree, 'dsh-mp-search')
     if (!search || search.args[1].role !== 'combobox' || search.args[1]['aria-expanded'] !== true
-      || search.args[1]['aria-controls'] !== 'dsh-mp-listbox'
+      || search.args[1]['aria-controls'] !== 'dsh-mp-r0-listbox'
       || search.args[1]['aria-activedescendant'] !== undefined) {
       console.error('FAIL: search input must be a combobox wired to the listbox'); process.exit(1)
     }
@@ -1431,7 +1434,7 @@ function loadClient(stateQueue, setCalls) {
     const face = reg.value.opts.inject('sess-1')
     const tree = reg.value.Component({ locked: false, ...face })
     const search = findByClass(tree, 'dsh-mp-search')
-    if (search.args[1]['aria-activedescendant'] !== 'dsh-mp-opt-1') {
+    if (search.args[1]['aria-activedescendant'] !== 'dsh-mp-r0-opt-1') {
       console.error('FAIL: aria-activedescendant must mirror the highlight, got '
         + JSON.stringify(search.args[1]['aria-activedescendant'])); process.exit(1)
     }
@@ -1720,6 +1723,50 @@ function loadClient(stateQueue, setCalls) {
   console.log('PASS non-object reasoning blocks never crash the render (directory path)')
 }
 
+// --- Directory-path effort entries without a string id/name are dropped ---
+// The per-session directory snapshot never passes through cleanReasoning, so
+// the component itself must drop junk effort entries; an id-less entry would
+// otherwise render a labelled row whose click silently selects provider
+// default.
+{
+  setup()
+  const junkEffortStore = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({
+      current: { provider: 'p1', model: 'm1', reasoningEffort: 'max' },
+      routable: true,
+      groups: [
+        {
+          id: 'p1',
+          name: 'DeepSeek',
+          models: [{
+            id: 'm1',
+            name: 'deepseek-v4-pro',
+            reasoning: { efforts: [null, 'junk', { id: 'low' }, { id: 'max', name: 'Max' }] },
+          }],
+        },
+      ],
+      failures: [],
+      status: 'ready',
+      error: null,
+    }),
+  }
+  const reg = { value: null }
+  const ctx = makeCtx(reg, junkEffortStore)
+  const mod = loadClient(['effort', '', null, null, null, -1])
+  mod.apply(ctx)
+  const face = reg.value.opts.inject('sess-1')
+  const tree = reg.value.Component({ locked: false, ...face })
+  // Rows: 提供方默认 + Max only — every junk entry dropped.
+  const options = findAllByClass(tree, 'dsh-mp-option')
+  if (options.length !== 2 || !textOf(options[0]).includes('提供方默认')
+    || !textOf(options[1]).includes('Max')) {
+    console.error('FAIL: junk effort entries must be dropped on the directory path, got '
+      + options.length + ' rows'); process.exit(1)
+  }
+  console.log('PASS directory-path effort entries without a string id/name are dropped')
+}
+
 // --- Choosing a model whose reasoning block is non-object attaches no effort ---
 // The click path used to dereference model.reasoning.defaultEffort directly;
 // reasoning: null threw a TypeError on click.
@@ -1918,12 +1965,12 @@ function loadClient(stateQueue, setCalls) {
   const face = reg.value.opts.inject('sess-1')
   const tree = reg.value.Component({ locked: false, ...face })
   const trigger = findByClass(tree, 'dsh-mp-effortTrigger')
-  if (!trigger || trigger.args[1]['aria-controls'] !== 'dsh-mp-effort-listbox') {
-    console.error('FAIL: effort trigger must carry aria-controls=dsh-mp-effort-listbox'); process.exit(1)
+  if (!trigger || trigger.args[1]['aria-controls'] !== 'dsh-mp-r0-effort-listbox') {
+    console.error('FAIL: effort trigger must carry aria-controls to its instance-scoped listbox'); process.exit(1)
   }
   const menu = findByClass(tree, 'dsh-mp-menuEffort')
-  if (!menu || menu.args[1].id !== 'dsh-mp-effort-listbox') {
-    console.error('FAIL: effort menu must carry id=dsh-mp-effort-listbox'); process.exit(1)
+  if (!menu || menu.args[1].id !== 'dsh-mp-r0-effort-listbox') {
+    console.error('FAIL: effort menu must carry the instance-scoped listbox id'); process.exit(1)
   }
   console.log('PASS effort trigger is wired to its listbox via aria-controls')
 }
