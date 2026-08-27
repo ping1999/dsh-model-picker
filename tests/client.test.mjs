@@ -11,6 +11,8 @@
 //   (pane, query, activeProvider, notice, optimistic, highlight) and its
 //   setters record [hookIndex, value] pairs into setCalls. There is no
 //   re-render, so multi-step interactions re-render with an updated queue.
+//   useEffect runs its callback once, synchronously (cleanups are dropped),
+//   so mount effects observe the same first-frame values the assertions do.
 // Run: node --test tests/client.test.mjs
 import { readFileSync } from 'node:fs'
 
@@ -125,7 +127,7 @@ function makeReact(stateQueue, setCalls) {
       const value = stateQueue === null ? init : stateQueue[index]
       return [value, (v) => { if (setCalls) setCalls.push([index, v]) }]
     },
-    useEffect: () => {},
+    useEffect: (fn) => { fn() },
     useRef: (v) => ({ current: v }),
     useMemo: (fn) => fn(),
     useCallback: (fn) => fn,
@@ -1924,4 +1926,286 @@ function loadClient(stateQueue, setCalls) {
     console.error('FAIL: effort menu must carry id=dsh-mp-effort-listbox'); process.exit(1)
   }
   console.log('PASS effort trigger is wired to its listbox via aria-controls')
+}
+
+// --- Per-session selection memory: replayed once per host generation ---
+// The host restores a session's model/effort from the session log's last
+// request header on restart, so a pick made after the session's last request
+// silently reverts. The panel remembers the settled selection per session in
+// localStorage and replays it when the host-restored snapshot diverges.
+{
+  const SELECTIONS_KEY = 'dsh-model-picker:selections:v1'
+  const REASONED_GROUPS = [
+    {
+      id: 'p1',
+      name: 'DeepSeek',
+      models: [{
+        id: 'm1',
+        name: 'deepseek-v4-pro',
+        reasoning: { efforts: [{ id: 'off', name: 'Off' }, { id: 'max', name: 'Max' }] },
+      }],
+    },
+  ]
+  const LOADING = { current: null, routable: null, groups: [], failures: [], status: 'loading', error: null }
+  const IDLE = { current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }
+
+  // A directory store the block can drive by hand: emit() swaps the snapshot
+  // and notifies the subscribers the component registered through its effect.
+  function makeControllableStore(initial) {
+    let snap = initial
+    const listeners = new Set()
+    return {
+      subscribe: (fn) => { listeners.add(fn); return () => { listeners.delete(fn) } },
+      getSnapshot: () => snap,
+      emit: (next) => { snap = next; for (const fn of listeners) fn() },
+    }
+  }
+
+  // Same wiring as makeCtx but with select() recorded into `selections` and
+  // ctx.on handlers captured into onHandlers (connection/reset drives the
+  // host-generation gate).
+  function makeMemoryCtx(reg, store, selections, onHandlers) {
+    return {
+      get(name) {
+        if (name === 'slots') {
+          return {
+            inject(key, cb) { if (key === 'conversation.input.model') reg.value = cb() },
+            register(opts, Component) { return { opts, Component } },
+          }
+        }
+        if (name === 'connection') return { api: { llm: { models: () => new Promise(() => {}) } } }
+        if (name === 'remote') return { $on: () => {} }
+        if (name === 'modelDirectories') {
+          return {
+            directoryFor: () => ({
+              store,
+              load: () => {},
+              select: (s) => { selections.push(s); return Promise.resolve() },
+            }),
+          }
+        }
+        if (name === 'sessions') return { subagentAddress: () => undefined }
+        return undefined
+      },
+      effect(fn) { return fn() },
+      on(event, fn) { (onHandlers[event] = onHandlers[event] ?? []).push(fn) },
+    }
+  }
+
+  const mockSelectionsStorage = (stored, writes) => {
+    globalThis.localStorage = {
+      getItem: (key) => (key === SELECTIONS_KEY && stored !== undefined ? JSON.stringify(stored) : null),
+      setItem: (k, v) => { if (writes) writes.push([k, v]) },
+      removeItem: () => {},
+    }
+  }
+
+  // A) Host restart restores a stale selection: the remembered effort replays
+  //    on the loading -> ready edge.
+  {
+    setup()
+    mockSelectionsStorage({ v: 1, sessions: { 'sess-1': { provider: 'p1', model: 'm1', effort: 'max', at: Date.now() } } })
+    const restored = {
+      current: { provider: 'p1', model: 'm1' }, // stale: the header predates the effort pick
+      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
+    }
+    const store = makeControllableStore(LOADING)
+    const selections = []
+    const reg = { value: null }
+    const ctx = makeMemoryCtx(reg, store, selections, {})
+    const mod = loadClient(null)
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    reg.value.Component({ locked: false, ...face })
+    store.emit(restored)
+    if (selections.length !== 1 || selections[0].provider !== 'p1' || selections[0].model !== 'm1'
+      || selections[0].reasoningEffort !== 'max') {
+      console.error('FAIL: the remembered selection should replay on the ready edge: ' + JSON.stringify(selections))
+      process.exit(1)
+    }
+    console.log('PASS host-restored stale selection is replayed from the per-session memory')
+  }
+
+  // B) No record: nothing replays, and a repeated ready cycle stays quiet
+  //    (the directory is marked reconciled for this host generation).
+  {
+    setup()
+    mockSelectionsStorage(undefined)
+    const restored = {
+      current: { provider: 'p1', model: 'm1' },
+      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
+    }
+    const store = makeControllableStore(LOADING)
+    const selections = []
+    const reg = { value: null }
+    const ctx = makeMemoryCtx(reg, store, selections, {})
+    const mod = loadClient(null)
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    reg.value.Component({ locked: false, ...face })
+    store.emit(restored)
+    store.emit(IDLE)
+    store.emit(restored)
+    if (selections.length !== 0) {
+      console.error('FAIL: without a record nothing may replay, got ' + JSON.stringify(selections)); process.exit(1)
+    }
+    console.log('PASS no record -> no replay, repeated ready cycles stay quiet')
+  }
+
+  // C) The restored snapshot already matches the record: nothing to do.
+  {
+    setup()
+    mockSelectionsStorage({ v: 1, sessions: { 'sess-1': { provider: 'p1', model: 'm1', effort: 'max', at: Date.now() } } })
+    const restored = {
+      current: { provider: 'p1', model: 'm1', reasoningEffort: 'max' },
+      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
+    }
+    const store = makeControllableStore(LOADING)
+    const selections = []
+    const reg = { value: null }
+    const ctx = makeMemoryCtx(reg, store, selections, {})
+    const mod = loadClient(null)
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    reg.value.Component({ locked: false, ...face })
+    store.emit(restored)
+    if (selections.length !== 0) {
+      console.error('FAIL: a matching restored selection must not replay: ' + JSON.stringify(selections)); process.exit(1)
+    }
+    console.log('PASS restored selection matching the record is left alone')
+  }
+
+  // D) The selecting -> ready edge persists the settled (resolved) selection.
+  {
+    setup()
+    const writes = []
+    mockSelectionsStorage(undefined, writes)
+    const groups = [{
+      id: 'p1',
+      name: 'DeepSeek',
+      models: [
+        { id: 'm1', name: 'deepseek-v4-flash' },
+        { id: 'm2', name: 'deepseek-v4-pro', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }] } },
+      ],
+    }]
+    const selecting = {
+      current: { provider: 'p1', model: 'm1' },
+      routable: true, groups, failures: [], status: 'selecting', error: null,
+    }
+    const settled = {
+      current: { provider: 'p1', model: 'm2', reasoningEffort: 'high' },
+      routable: true, groups, failures: [], status: 'ready', error: null,
+    }
+    const store = makeControllableStore(selecting)
+    const selections = []
+    const reg = { value: null }
+    const ctx = makeMemoryCtx(reg, store, selections, {})
+    const mod = loadClient(null)
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    reg.value.Component({ locked: false, ...face })
+    store.emit(settled)
+    const write = writes.find(([key]) => key === SELECTIONS_KEY)
+    if (!write) { console.error('FAIL: the settled selection must be persisted'); process.exit(1) }
+    const record = JSON.parse(write[1]).sessions?.['sess-1']
+    if (!record || record.provider !== 'p1' || record.model !== 'm2' || record.effort !== 'high'
+      || typeof record.at !== 'number') {
+      console.error('FAIL: persisted record mismatch: ' + JSON.stringify(record)); process.exit(1)
+    }
+    if (selections.length !== 0) {
+      console.error('FAIL: the settle edge must persist, not replay: ' + JSON.stringify(selections)); process.exit(1)
+    }
+    console.log('PASS a settled select persists the resolved selection per session')
+  }
+
+  // E) The remembered model vanished from the catalog: skip the replay (a
+  //    rejected select would latch an error status onto the panel).
+  {
+    setup()
+    const writes = []
+    mockSelectionsStorage({ v: 1, sessions: { 'sess-1': { provider: 'p9', model: 'gone', effort: null, at: Date.now() } } }, writes)
+    const restored = {
+      current: { provider: 'p1', model: 'm1' },
+      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
+    }
+    const store = makeControllableStore(LOADING)
+    const selections = []
+    const reg = { value: null }
+    const ctx = makeMemoryCtx(reg, store, selections, {})
+    const mod = loadClient(null)
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    reg.value.Component({ locked: false, ...face })
+    store.emit(restored)
+    if (selections.length !== 0) {
+      console.error('FAIL: a vanished model must not replay: ' + JSON.stringify(selections)); process.exit(1)
+    }
+    if (writes.some(([key]) => key === SELECTIONS_KEY)) {
+      console.error('FAIL: a skipped replay must not touch the stored selections'); process.exit(1)
+    }
+    console.log('PASS a record whose model left the catalog is skipped without a write')
+  }
+
+  // F) The generation gate: one replay per host generation; connection/reset
+  //    re-arms the reconcile for the post-restart restore.
+  {
+    setup()
+    mockSelectionsStorage({ v: 1, sessions: { 'sess-1': { provider: 'p1', model: 'm1', effort: 'max', at: Date.now() } } })
+    const restored = {
+      current: { provider: 'p1', model: 'm1' },
+      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
+    }
+    // Mount straight into the restored snapshot: the catch-up reconcile fires.
+    const store = makeControllableStore(restored)
+    const selections = []
+    const onHandlers = {}
+    const reg = { value: null }
+    const ctx = makeMemoryCtx(reg, store, selections, onHandlers)
+    const mod = loadClient(null)
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    reg.value.Component({ locked: false, ...face })
+    if (selections.length !== 1) {
+      console.error('FAIL: the mount-time catch-up should replay once, got ' + selections.length); process.exit(1)
+    }
+    store.emit(IDLE)
+    store.emit(restored)
+    if (selections.length !== 1) {
+      console.error('FAIL: the same generation must not replay twice: ' + JSON.stringify(selections)); process.exit(1)
+    }
+    // Host restart: both the catalog refresh and the generation bump listen.
+    for (const fn of onHandlers['connection/reset'] ?? []) fn()
+    store.emit(IDLE)
+    store.emit(restored)
+    if (selections.length !== 2 || selections[1].provider !== 'p1' || selections[1].model !== 'm1'
+      || selections[1].reasoningEffort !== 'max') {
+      console.error('FAIL: a new host generation should re-arm the replay: ' + JSON.stringify(selections)); process.exit(1)
+    }
+    console.log('PASS the replay is gated per host generation and re-armed by connection/reset')
+  }
+
+  // G) An explicit provider-default record (effort null) replays WITHOUT the
+  //    reasoningEffort key, clearing a stale restored effort.
+  {
+    setup()
+    mockSelectionsStorage({ v: 1, sessions: { 'sess-1': { provider: 'p1', model: 'm1', effort: null, at: Date.now() } } })
+    const restored = {
+      current: { provider: 'p1', model: 'm1', reasoningEffort: 'low' },
+      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
+    }
+    const store = makeControllableStore(LOADING)
+    const selections = []
+    const reg = { value: null }
+    const ctx = makeMemoryCtx(reg, store, selections, {})
+    const mod = loadClient(null)
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    reg.value.Component({ locked: false, ...face })
+    store.emit(restored)
+    if (selections.length !== 1 || selections[0].provider !== 'p1' || selections[0].model !== 'm1'
+      || 'reasoningEffort' in selections[0]) {
+      console.error('FAIL: provider-default replay must omit reasoningEffort: ' + JSON.stringify(selections)); process.exit(1)
+    }
+    console.log('PASS an explicit provider-default record replays without the reasoningEffort key')
+  }
 }
