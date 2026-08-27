@@ -1,7 +1,7 @@
 {
   "name": "dsh-model-picker",
   "description": "Enhanced model picker for the dsh web GUI: provider-tabbed left column with model list on the right, both independently scrollable, plus cross-provider search",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "type": "module",
   "main": "lib/host.js",
   "exports": {
@@ -28,11 +28,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Sanqi-normal/dsh-model-picker.git"
+    "url": "git+https://github.com/ping1999/dsh-model-picker.git"
   },
-  "homepage": "https://github.com/Sanqi-normal/dsh-model-picker",
+  "homepage": "https://github.com/ping1999/dsh-model-picker",
   "bugs": {
-    "url": "https://github.com/Sanqi-normal/dsh-model-picker/issues"
+    "url": "https://github.com/ping1999/dsh-model-picker/issues"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -54,6 +54,17 @@
     "@deepseek-ai/cordis": "*",
     "@deepseek-ai/dsh-client-runtime": "*",
     "@deepseek-ai/dsh-client-ui-slots": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-runtime": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-slots": {
+      "optional": true
+    }
   },
   "publishConfig": {
     "access": "public"
