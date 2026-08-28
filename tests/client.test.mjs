@@ -366,12 +366,17 @@ function loadClient(stateQueue, setCalls) {
 }
 
 // --- First load (no cached groups) keeps the full-pane loading status ---
+// With nothing cached anywhere, the first open shows the loading row. On the
+// catalog path nothing loads the per-session directory, so the status comes
+// from the catalog itself: drive the store into 'loading' before the render
+// (the harness never re-renders) and keep the directory at 'idle' to prove
+// which store supplies the row.
 {
   setup()
   const firstLoadStore = {
     subscribe: () => () => {},
     getSnapshot: () => ({
-      current: null, routable: null, groups: [], failures: [], status: 'loading', error: null,
+      current: null, routable: null, groups: [], failures: [], status: 'idle', error: null,
     }),
   }
   const reg = { value: null }
@@ -380,6 +385,10 @@ function loadClient(stateQueue, setCalls) {
   const mod = loadClient(stateQueue)
   mod.apply(ctx)
   const face = reg.value.opts.inject('sess-1')
+  void face.catalog.load() // never-resolving stub RPC: the catalog sits at 'loading'
+  if (face.catalog.getSnapshot().status !== 'loading') {
+    console.error('FAIL: catalog should be loading after load()'); process.exit(1)
+  }
   const tree = reg.value.Component({ locked: false, ...face })
   const list = findByClass(tree, 'dsh-mp-list')
   if (!list) { console.error('FAIL: dsh-mp-list not rendered'); process.exit(1) }
@@ -389,6 +398,73 @@ function loadClient(stateQueue, setCalls) {
     process.exit(1)
   }
   console.log('PASS first load with empty groups shows the loading status')
+}
+
+// --- Catalog first-load failure surfaces the retry row over an idle directory ---
+// Nothing loads the per-session directory on the catalog path: with no cache
+// anywhere, a rejected first load must surface the catalog's own error row
+// (with a retry button) instead of a silent blank panel.
+{
+  setup()
+  const idleDir = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
+  }
+  const reg = { value: null }
+  const ctx = makeCtx(reg, idleDir, {
+    connection: { api: { llm: { models: () => Promise.reject(new Error('boom')) } } },
+  })
+  const mod = loadClient(['models', '', null, null, null, -1])
+  mod.apply(ctx)
+  const face = reg.value.opts.inject('sess-1')
+  await face.catalog.load()
+  if (face.catalog.getSnapshot().status !== 'error') {
+    console.error('FAIL: catalog should record the first-load failure'); process.exit(1)
+  }
+  const tree = reg.value.Component({ locked: false, ...face })
+  const errorRow = findByClass(tree, 'dsh-mp-error')
+  if (!errorRow || errorRow.args[1].role !== 'alert' || !textOf(errorRow).includes('boom')) {
+    console.error('FAIL: a failed first load must render a role=alert row carrying the error'); process.exit(1)
+  }
+  if (!findByClass(errorRow, 'dsh-mp-retry')) {
+    console.error('FAIL: the first-load failure row must carry a retry button'); process.exit(1)
+  }
+  if (findByClass(tree, 'dsh-mp-empty')) {
+    console.error('FAIL: the error state must not also render the no-models placeholder'); process.exit(1)
+  }
+  console.log('PASS catalog first-load failure surfaces the retry row over an idle directory')
+}
+
+// --- An all-failures catalog answer renders the warning rows over an idle directory ---
+// A 0-groups + failures answer never hydrates catalogLive; the failure rows
+// must still reach the panel when the directory has nothing to show either.
+{
+  setup()
+  const idleDir = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
+  }
+  const reg = { value: null }
+  const ctx = makeCtx(reg, idleDir, {
+    connection: {
+      api: {
+        llm: {
+          models: () => Promise.resolve({ groups: [], failures: [{ id: 'p3', name: 'Broken', message: 'HTTP 500' }] }),
+        },
+      },
+    },
+  })
+  const mod = loadClient(['models', '', null, null, null, -1])
+  mod.apply(ctx)
+  const face = reg.value.opts.inject('sess-1')
+  await face.catalog.load()
+  const tree = reg.value.Component({ locked: false, ...face })
+  const warning = findByClass(tree, 'dsh-mp-warning')
+  if (!warning || textOf(warning) !== 'Broken 加载失败：HTTP 500重试') {
+    console.error('FAIL: the all-failures answer must render the warning row, got '
+      + JSON.stringify(warning && textOf(warning))); process.exit(1)
+  }
+  console.log('PASS all-failures catalog answer renders the warning rows over an idle directory')
 }
 
 // --- Reasoning effort gets its own trigger right of the model trigger ---
@@ -1822,6 +1898,128 @@ function loadClient(stateQueue, setCalls) {
   console.log('PASS choosing a model with a non-object reasoning block attaches no reasoningEffort')
 }
 
+// --- A non-string defaultEffort is normalized away on both data paths ---
+// cleanReasoning covers the catalog path; the never-cleaned directory path is
+// guarded inside the component (menu row + trigger label) and on the click
+// path (the RPC payload). defaultEffort: 42 must behave as "no default".
+{
+  // Catalog path: the snapshot itself is normalized.
+  {
+    setup()
+    const dirty = {
+      groups: [{
+        id: 'p1',
+        name: 'DeepSeek',
+        models: [{ id: 'm1', name: 'm1', reasoning: { efforts: [{ id: 'low', name: 'Low' }], defaultEffort: 42 } }],
+      }],
+      failures: [],
+    }
+    const emptyDir = {
+      subscribe: () => () => {},
+      getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
+    }
+    const reg = { value: null }
+    const ctx = makeCtx(reg, emptyDir, {
+      connection: { api: { llm: { models: () => Promise.resolve(dirty) } } },
+    })
+    const mod = loadClient(['models', '', null, null, null, -1])
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    await face.catalog.load()
+    const reasoning = face.catalog.getSnapshot().groups[0].models[0].reasoning
+    if (!reasoning || reasoning.defaultEffort !== undefined || reasoning.efforts.length !== 1) {
+      console.error('FAIL: a non-string defaultEffort must normalize to undefined: ' + JSON.stringify(reasoning))
+      process.exit(1)
+    }
+  }
+  // Directory path: the effort menu keeps the provider-default row and the
+  // trigger reads provider default, as if no defaultEffort were declared.
+  {
+    setup()
+    const junkDefaultStore = {
+      subscribe: () => () => {},
+      getSnapshot: () => ({
+        current: { provider: 'p1', model: 'm1' },
+        routable: true,
+        groups: [
+          {
+            id: 'p1',
+            name: 'DeepSeek',
+            models: [{ id: 'm1', name: 'deepseek-v4-pro', reasoning: { efforts: [{ id: 'low', name: 'Low' }], defaultEffort: 42 } }],
+          },
+        ],
+        failures: [],
+        status: 'ready',
+        error: null,
+      }),
+    }
+    const reg = { value: null }
+    const ctx = makeCtx(reg, junkDefaultStore)
+    const mod = loadClient(['effort', '', null, null, null, -1])
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    const tree = reg.value.Component({ locked: false, ...face })
+    const label = findByClass(tree, 'dsh-mp-effortTriggerLabel')
+    if (!label || textOf(label) !== '提供方默认') {
+      console.error('FAIL: a junk defaultEffort must read as provider default, got '
+        + JSON.stringify(label && textOf(label))); process.exit(1)
+    }
+    const options = findAllByClass(tree, 'dsh-mp-option')
+    if (options.length !== 2 || !textOf(options[0]).includes('提供方默认')) {
+      console.error('FAIL: a junk defaultEffort must keep the provider-default row, got ' + options.length)
+      process.exit(1)
+    }
+  }
+  // Click path: choosing such a model attaches no reasoningEffort.
+  {
+    setup()
+    const selections = []
+    const junkDefaultStore = {
+      subscribe: () => () => {},
+      getSnapshot: () => ({
+        current: { provider: 'p1', model: 'm1' },
+        routable: true,
+        groups: [{
+          id: 'p1',
+          name: 'DeepSeek',
+          models: [
+            { id: 'm1', name: 'deepseek-v4-flash' },
+            { id: 'm2', name: 'deepseek-v4-pro', reasoning: { efforts: [{ id: 'low', name: 'Low' }], defaultEffort: 42 } },
+          ],
+        }],
+        failures: [],
+        status: 'ready',
+        error: null,
+      }),
+    }
+    const reg = { value: null }
+    const ctx = makeCtx(reg, junkDefaultStore, {
+      modelDirectories: {
+        directoryFor: () => ({
+          store: junkDefaultStore,
+          load: () => {},
+          select: (s) => { selections.push(s); return Promise.resolve() },
+        }),
+      },
+    })
+    const mod = loadClient(['models', '', null, null, null, -1])
+    mod.apply(ctx)
+    const face = reg.value.opts.inject('sess-1')
+    const tree = reg.value.Component({ locked: false, ...face })
+    const options = findAllByClass(tree, 'dsh-mp-option')
+    if (options.length !== 2) {
+      console.error('FAIL: expected both provider models, got ' + options.length); process.exit(1)
+    }
+    options[1].args[1].onClick()
+    if (selections.length !== 1 || selections[0].provider !== 'p1' || selections[0].model !== 'm2'
+      || 'reasoningEffort' in selections[0]) {
+      console.error('FAIL: a junk defaultEffort must not leak into the select payload: '
+        + JSON.stringify(selections)); process.exit(1)
+    }
+  }
+  console.log('PASS a non-string defaultEffort is normalized away on both data paths')
+}
+
 // --- Dirty reasoning blocks and id-less entries are cleaned on the catalog path ---
 // cleanReasoning normalizes a non-object block to undefined and drops effort
 // entries without a string id/name; cleanGroups drops groups/models without a
@@ -1973,6 +2171,59 @@ function loadClient(stateQueue, setCalls) {
     console.error('FAIL: effort menu must carry the instance-scoped listbox id'); process.exit(1)
   }
   console.log('PASS effort trigger is wired to its listbox via aria-controls')
+}
+
+// --- The model trigger is wired to its listbox (aria-controls) ---
+{
+  setup()
+  const reg = { value: null }
+  const ctx = makeCtx(reg)
+  const mod = loadClient(['models', '', null, null, null, -1])
+  mod.apply(ctx)
+  const face = reg.value.opts.inject('sess-1')
+  const tree = reg.value.Component({ locked: false, ...face })
+  const trigger = findByClass(tree, 'dsh-mp-trigger')
+  if (!trigger || trigger.args[1]['aria-controls'] !== 'dsh-mp-r0-listbox') {
+    console.error('FAIL: model trigger must carry aria-controls to its instance-scoped listbox'); process.exit(1)
+  }
+  console.log('PASS model trigger is wired to its listbox via aria-controls')
+}
+
+// --- A reasoning block with an empty efforts array hides the effort trigger ---
+// `reasoning: { efforts: [] }` offers nothing to pick: without the guard the
+// trigger opened a menu whose only row ("provider default") is a no-op click.
+{
+  setup()
+  const emptyEffortsStore = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({
+      current: { provider: 'p1', model: 'm1' },
+      routable: true,
+      groups: [
+        {
+          id: 'p1',
+          name: 'DeepSeek',
+          models: [{ id: 'm1', name: 'deepseek-v4-flash', reasoning: { efforts: [] } }],
+        },
+      ],
+      failures: [],
+      status: 'ready',
+      error: null,
+    }),
+  }
+  const reg = { value: null }
+  const ctx = makeCtx(reg, emptyEffortsStore)
+  const mod = loadClient(['effort', '', null, null, null, -1])
+  mod.apply(ctx)
+  const face = reg.value.opts.inject('sess-1')
+  const tree = reg.value.Component({ locked: false, ...face })
+  if (findByClass(tree, 'dsh-mp-effortTrigger')) {
+    console.error('FAIL: an empty efforts array must hide the effort trigger'); process.exit(1)
+  }
+  if (findByClass(tree, 'dsh-mp-menuEffort')) {
+    console.error('FAIL: an empty efforts array must not render the effort menu'); process.exit(1)
+  }
+  console.log('PASS empty efforts array hides the effort trigger (no provider-default-only no-op menu)')
 }
 
 // --- Per-session selection memory: replayed once per host generation ---
