@@ -4,8 +4,8 @@
 // renders without runtime errors (closed trigger and open menu passes).
 //
 // Harness notes:
-// - setup() installs the browser globals (window/document/navigator/
-//   localStorage); every block calls it first, then overrides what it needs.
+// - setup() installs the browser globals (window/document/navigator);
+//   every block calls it first, then overrides what it needs.
 // - loadClient(stateQueue, setCalls) re-evaluates the bundle and runs the
 //   factory with a position-based React stub: useState reads stateQueue
 //   (pane, query, activeProvider, notice, optimistic, highlight) and its
@@ -33,7 +33,7 @@ const dirStore = {
   }),
 }
 
-// extra overrides individual ctx.get(name) answers (connection, sessions,
+// extra overrides individual ctx.get(name) answers (sessions,
 // modelDirectories, ...) so a block can swap one service without rebuilding
 // the whole context.
 function makeCtx(reg, store, extra) {
@@ -48,12 +48,6 @@ function makeCtx(reg, store, extra) {
           register(opts, Component) { return { opts, Component } },
         }
       }
-      if (name === 'connection') {
-        // Never resolves: the catalog stays empty/loading so the per-session
-        // directory snapshot drives the list in these tests.
-        return { api: { llm: { models: () => new Promise(() => {}) } } }
-      }
-      if (name === 'remote') return { $on: () => {} }
       if (name === 'modelDirectories') {
         return { directoryFor: () => ({ store: directoryStore, load: () => {}, select: () => Promise.resolve() }) }
       }
@@ -151,7 +145,7 @@ const src = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
 let loaded = null
 
 // Install the browser globals every block depends on; blocks override
-// localStorage / navigator afterwards when they need non-defaults.
+// navigator afterwards when they need non-defaults.
 function setup() {
   globalThis.window = { __ModuleLoader__: { load: (handoff) => { loaded = handoff } } }
   globalThis.document = {
@@ -159,7 +153,6 @@ function setup() {
     getElementById: () => null,
     createElement: () => ({ remove: () => {} }),
   }
-  globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} }
   Object.defineProperty(globalThis, 'navigator', { value: { language: 'zh-CN' }, configurable: true })
 }
 
@@ -187,7 +180,7 @@ function loadClient(stateQueue, setCalls) {
   if (!mod || !Array.isArray(mod.inject) || typeof mod.apply !== 'function') {
     console.error('FAIL: bad module shape'); process.exit(1)
   }
-  if (mod.inject.join(',') !== 'slots,connection,remote') { console.error('FAIL: inject=' + mod.inject); process.exit(1) }
+  if (mod.inject.join(',') !== 'slots') { console.error('FAIL: inject=' + mod.inject); process.exit(1) }
 
   mod.apply(ctx)
   if (!reg.value) { console.error('FAIL: seat not registered'); process.exit(1) }
@@ -365,18 +358,16 @@ function loadClient(stateQueue, setCalls) {
   console.log('PASS refresh with cached groups keeps the list visible with no loading row')
 }
 
-// --- First load (no cached groups) keeps the full-pane loading status ---
-// With nothing cached anywhere, the first open shows the loading row. On the
-// catalog path nothing loads the per-session directory, so the status comes
-// from the catalog itself: drive the store into 'loading' before the render
-// (the harness never re-renders) and keep the directory at 'idle' to prove
-// which store supplies the row.
+// --- First load (no groups yet) keeps the full-pane loading status ---
+// The shared directory is the single source: while the host is still on its
+// first load (status 'loading', no groups), the open pane shows the
+// full-pane loading row.
 {
   setup()
   const firstLoadStore = {
     subscribe: () => () => {},
     getSnapshot: () => ({
-      current: null, routable: null, groups: [], failures: [], status: 'idle', error: null,
+      current: null, routable: null, groups: [], failures: [], status: 'loading', error: null,
     }),
   }
   const reg = { value: null }
@@ -385,10 +376,6 @@ function loadClient(stateQueue, setCalls) {
   const mod = loadClient(stateQueue)
   mod.apply(ctx)
   const face = reg.value.opts.inject('sess-1')
-  void face.catalog.load() // never-resolving stub RPC: the catalog sits at 'loading'
-  if (face.catalog.getSnapshot().status !== 'loading') {
-    console.error('FAIL: catalog should be loading after load()'); process.exit(1)
-  }
   const tree = reg.value.Component({ locked: false, ...face })
   const list = findByClass(tree, 'dsh-mp-list')
   if (!list) { console.error('FAIL: dsh-mp-list not rendered'); process.exit(1) }
@@ -400,27 +387,20 @@ function loadClient(stateQueue, setCalls) {
   console.log('PASS first load with empty groups shows the loading status')
 }
 
-// --- Catalog first-load failure surfaces the retry row over an idle directory ---
-// Nothing loads the per-session directory on the catalog path: with no cache
-// anywhere, a rejected first load must surface the catalog's own error row
-// (with a retry button) instead of a silent blank panel.
+// --- A failed directory load surfaces the retry row ---
+// A rejected load (status 'error', no groups) must surface the store's error
+// as a role=alert row with a retry button instead of a silent blank panel.
 {
   setup()
-  const idleDir = {
+  const errorDir = {
     subscribe: () => () => {},
-    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
+    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'error', error: 'boom' }),
   }
   const reg = { value: null }
-  const ctx = makeCtx(reg, idleDir, {
-    connection: { api: { llm: { models: () => Promise.reject(new Error('boom')) } } },
-  })
+  const ctx = makeCtx(reg, errorDir)
   const mod = loadClient(['models', '', null, null, null, -1])
   mod.apply(ctx)
   const face = reg.value.opts.inject('sess-1')
-  await face.catalog.load()
-  if (face.catalog.getSnapshot().status !== 'error') {
-    console.error('FAIL: catalog should record the first-load failure'); process.exit(1)
-  }
   const tree = reg.value.Component({ locked: false, ...face })
   const errorRow = findByClass(tree, 'dsh-mp-error')
   if (!errorRow || errorRow.args[1].role !== 'alert' || !textOf(errorRow).includes('boom')) {
@@ -432,39 +412,34 @@ function loadClient(stateQueue, setCalls) {
   if (findByClass(tree, 'dsh-mp-empty')) {
     console.error('FAIL: the error state must not also render the no-models placeholder'); process.exit(1)
   }
-  console.log('PASS catalog first-load failure surfaces the retry row over an idle directory')
+  console.log('PASS failed directory load surfaces the retry row')
 }
 
-// --- An all-failures catalog answer renders the warning rows over an idle directory ---
-// A 0-groups + failures answer never hydrates catalogLive; the failure rows
-// must still reach the panel when the directory has nothing to show either.
+// --- Zero groups with provider failures renders the warning rows ---
+// When no provider loaded (groups empty) the per-failure warning rows must
+// still reach the panel.
 {
   setup()
-  const idleDir = {
+  const failDir = {
     subscribe: () => () => {},
-    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
+    getSnapshot: () => ({
+      current: null, routable: null, groups: [],
+      failures: [{ id: 'p3', name: 'Broken', message: 'HTTP 500' }],
+      status: 'ready', error: null,
+    }),
   }
   const reg = { value: null }
-  const ctx = makeCtx(reg, idleDir, {
-    connection: {
-      api: {
-        llm: {
-          models: () => Promise.resolve({ groups: [], failures: [{ id: 'p3', name: 'Broken', message: 'HTTP 500' }] }),
-        },
-      },
-    },
-  })
+  const ctx = makeCtx(reg, failDir)
   const mod = loadClient(['models', '', null, null, null, -1])
   mod.apply(ctx)
   const face = reg.value.opts.inject('sess-1')
-  await face.catalog.load()
   const tree = reg.value.Component({ locked: false, ...face })
   const warning = findByClass(tree, 'dsh-mp-warning')
   if (!warning || textOf(warning) !== 'Broken 加载失败：HTTP 500重试') {
-    console.error('FAIL: the all-failures answer must render the warning row, got '
+    console.error('FAIL: the failure rows must render, got '
       + JSON.stringify(warning && textOf(warning))); process.exit(1)
   }
-  console.log('PASS all-failures catalog answer renders the warning rows over an idle directory')
+  console.log('PASS zero groups with provider failures renders the warning rows')
 }
 
 // --- Reasoning effort gets its own trigger right of the model trigger ---
@@ -530,194 +505,6 @@ function loadClient(stateQueue, setCalls) {
     }
     console.log('PASS effort pane renders the effort options')
   }
-}
-
-// --- Boot warmup is delayed; push events revalidate through a debounce ---
-// Startup-cost regression guard: apply() must NOT fire an RPC eagerly (the
-// fan-out can include a live provider fetch). The warmup lands after
-// BOOT_WARMUP_DELAY (3s), persists the snapshot, and each push event triggers
-// one debounced (1.2s) reload.
-{
-  setup()
-  let calls = 0
-  const writes = []
-  const handlers = {}
-  const reg = { value: null }
-  globalThis.localStorage = {
-    getItem: () => null,
-    setItem: (k, v) => { writes.push([k, v]) },
-    removeItem: () => {},
-  }
-  const ctx = {
-    get(name) {
-      if (name === 'slots') {
-        return {
-          inject(key, cb) { if (key === 'conversation.input.model') reg.value = cb() },
-          register(opts, Component) { return { opts, Component } },
-        }
-      }
-      if (name === 'connection') {
-        return {
-          api: {
-            llm: {
-              models: () => {
-                calls += 1
-                return Promise.resolve({ groups: [{ id: 'p1', name: 'DeepSeek', models: [] }], failures: [] })
-              },
-            },
-          },
-        }
-      }
-      if (name === 'remote') return { $on: (event, fn) => { handlers[event] = fn } }
-      if (name === 'modelDirectories') {
-        return { directoryFor: () => ({ store: dirStore, load: () => {}, select: () => Promise.resolve() }) }
-      }
-      if (name === 'sessions') return { subagentAddress: () => undefined }
-      return undefined
-    },
-    effect(fn) { return fn() },
-    on() {},
-  }
-  const mod = loadClient(null)
-  mod.apply(ctx)
-  if (calls !== 0) {
-    console.error('FAIL: apply() must not issue an eager llm.models call on the startup path, got ' + calls)
-    process.exit(1)
-  }
-  await new Promise((resolve) => setTimeout(resolve, 3300))
-  if (calls !== 1) { console.error('FAIL: boot warmup should fire once, got ' + calls); process.exit(1) }
-  if (!writes.some(([key]) => key === 'dsh-model-picker:catalog:v1')) {
-    console.error('FAIL: a successful load should persist the catalog snapshot'); process.exit(1)
-  }
-  if (typeof handlers['llm/adapters-updated'] !== 'function' || typeof handlers['settings/document-updated'] !== 'function') {
-    console.error('FAIL: push events not subscribed'); process.exit(1)
-  }
-  handlers['llm/adapters-updated']()
-  if (calls !== 1) { console.error('FAIL: push events must be debounced, calls=' + calls); process.exit(1) }
-  await new Promise((resolve) => setTimeout(resolve, 1500))
-  if (calls !== 2) { console.error('FAIL: adapters-updated should revalidate, calls=' + calls); process.exit(1) }
-  handlers['settings/document-updated']()
-  await new Promise((resolve) => setTimeout(resolve, 1500))
-  if (calls !== 3) { console.error('FAIL: document-updated should revalidate, calls=' + calls); process.exit(1) }
-  console.log('PASS delayed boot warmup + localStorage persist + debounced push-event revalidation')
-}
-
-// --- Hydrated catalog paints instantly, even with an empty directory ---
-// Regression guard for the disk-cache path: a localStorage-hydrated catalog
-// must render the cached models on the very first frame — no loading row —
-// even when the per-session directory has not loaded anything yet.
-{
-  setup()
-  const stored = {
-    v: 1,
-    at: Date.now(),
-    groups: [{ id: 'p9', name: 'Cached', models: [{ id: 'm9', name: 'cached-model', description: 'from disk' }] }],
-    failures: [],
-  }
-  globalThis.localStorage = {
-    getItem: (key) => (key === 'dsh-model-picker:catalog:v1' ? JSON.stringify(stored) : null),
-    setItem: () => {},
-    removeItem: () => {},
-  }
-  const emptyDir = {
-    subscribe: () => () => {},
-    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
-  }
-  const reg = { value: null }
-  const ctx = makeCtx(reg, emptyDir)
-  const stateQueue = ['models', '', null, null, null, -1] // pane, query, activeProvider, notice, optimistic, highlight
-  const mod = loadClient(stateQueue)
-  mod.apply(ctx)
-  const face = reg.value.opts.inject('sess-1')
-  const tree = reg.value.Component({ locked: false, ...face })
-  if (!findByClass(tree, 'dsh-mp-option')) {
-    console.error('FAIL: hydrated catalog should render the cached models immediately'); process.exit(1)
-  }
-  if (findByClass(tree, 'dsh-mp-status')) {
-    console.error('FAIL: hydrated catalog must not show a loading row'); process.exit(1)
-  }
-  console.log('PASS hydrated catalog renders cached models with an empty directory')
-}
-
-// --- Empty RPC response never downgrades a hydrated catalog ---
-// Regression guard for the boot race: right after a web restart the host can
-// answer llm.models with { groups: [] } before adapters finish registering.
-// That empty answer must NOT clear the localStorage-hydrated list (the flash
-// to "暂无可用模型"), must not be persisted, and the revalidation must stay
-// invisible (no loading row over the cached groups).
-{
-  setup()
-  const stored = {
-    v: 1,
-    at: Date.now(),
-    groups: [{ id: 'p9', name: 'Cached', models: [{ id: 'm9', name: 'cached-model', description: 'from disk' }] }],
-    failures: [],
-  }
-  const writes = []
-  const handlers = {}
-  let calls = 0
-  globalThis.localStorage = {
-    getItem: (key) => (key === 'dsh-model-picker:catalog:v1' ? JSON.stringify(stored) : null),
-    setItem: (k, v) => { writes.push([k, v]) },
-    removeItem: () => {},
-  }
-  const emptyDir = {
-    subscribe: () => () => {},
-    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
-  }
-  const reg = { value: null }
-  const ctx = {
-    get(name) {
-      if (name === 'slots') {
-        return {
-          inject(key, cb) { if (key === 'conversation.input.model') reg.value = cb() },
-          register(opts, Component) { return { opts, Component } },
-        }
-      }
-      if (name === 'connection') {
-        return {
-          api: {
-            llm: {
-              // The boot-race answer: success, but zero groups.
-              models: () => { calls += 1; return Promise.resolve({ groups: [], failures: [] }) },
-            },
-          },
-        }
-      }
-      if (name === 'remote') return { $on: (event, fn) => { handlers[event] = fn } }
-      if (name === 'modelDirectories') {
-        return { directoryFor: () => ({ store: emptyDir, load: () => {}, select: () => Promise.resolve() }) }
-      }
-      if (name === 'sessions') return { subagentAddress: () => undefined }
-      return undefined
-    },
-    effect(fn) { return fn() },
-    on() {},
-  }
-  const stateQueue = ['models', '', null, null, null, -1] // pane, query, activeProvider, notice, optimistic, highlight
-  const mod = loadClient(stateQueue)
-  mod.apply(ctx)
-  // Simulate the push event storm; the debounced reload answers empty.
-  handlers['llm/adapters-updated']()
-  await new Promise((resolve) => setTimeout(resolve, 1600)) // past the 1.2s debounce
-  if (calls !== 1) {
-    console.error('FAIL: debounced revalidation should have fired exactly once, got ' + calls); process.exit(1)
-  }
-  if (writes.length !== 0) {
-    console.error('FAIL: an empty response must never be persisted over a good cache'); process.exit(1)
-  }
-  const face = reg.value.opts.inject('sess-1')
-  const tree = reg.value.Component({ locked: false, ...face })
-  if (!findByClass(tree, 'dsh-mp-option')) {
-    console.error('FAIL: empty response must not clear the hydrated model list'); process.exit(1)
-  }
-  if (findByClass(tree, 'dsh-mp-status')) {
-    console.error('FAIL: background revalidation must stay invisible over hydrated groups'); process.exit(1)
-  }
-  if (findByClass(tree, 'dsh-mp-empty')) {
-    console.error('FAIL: the "no models" placeholder must never replace hydrated data'); process.exit(1)
-  }
-  console.log('PASS empty RPC response never downgrades a hydrated catalog')
 }
 
 // --- Clicking a model fires select synchronously with the right payload ---
@@ -1255,38 +1042,28 @@ function loadClient(stateQueue, setCalls) {
   console.log('PASS provider failure rows render (zh + en) and hide while searching')
 }
 
-// --- Catalog load failure renders the alert row over the cached list ---
-// A hydrated catalog keeps painting its cached groups when a revalidation
-// rejects, and the error surfaces as a role=alert row with a retry button.
+// --- A refresh failure keeps the loaded list and renders the alert row ---
+// A rejected revalidation (status 'error' with groups already loaded) must
+// keep the list painted; the error surfaces as a role=alert row with a retry
+// button.
 {
   setup()
-  const stored = {
-    v: 1,
-    at: Date.now(),
-    groups: [{ id: 'p9', name: 'Cached', models: [{ id: 'm9', name: 'cached-model' }] }],
-    failures: [],
-  }
-  globalThis.localStorage = {
-    getItem: (key) => (key === 'dsh-model-picker:catalog:v1' ? JSON.stringify(stored) : null),
-    setItem: () => {},
-    removeItem: () => {},
-  }
-  const emptyDir = {
+  const errorDir = {
     subscribe: () => () => {},
-    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
+    getSnapshot: () => ({
+      current: { provider: 'p9', model: 'm9' },
+      routable: true,
+      groups: [{ id: 'p9', name: 'Cached', models: [{ id: 'm9', name: 'cached-model' }] }],
+      failures: [],
+      status: 'error',
+      error: 'boom',
+    }),
   }
   const reg = { value: null }
-  const ctx = makeCtx(reg, emptyDir, {
-    connection: { api: { llm: { models: () => Promise.reject(new Error('boom')) } } },
-  })
+  const ctx = makeCtx(reg, errorDir)
   const mod = loadClient(['models', '', null, null, null, -1])
   mod.apply(ctx)
   const face = reg.value.opts.inject('sess-1')
-  await face.catalog.load()
-  const snapshot = face.catalog.getSnapshot()
-  if (snapshot.status !== 'error' || snapshot.error !== 'boom') {
-    console.error('FAIL: catalog snapshot should record the load failure: ' + JSON.stringify(snapshot)); process.exit(1)
-  }
   const tree = reg.value.Component({ locked: false, ...face })
   const errorRow = findByClass(tree, 'dsh-mp-error')
   if (!errorRow || errorRow.args[1].role !== 'alert' || !textOf(errorRow).includes('boom')) {
@@ -1296,118 +1073,9 @@ function loadClient(stateQueue, setCalls) {
     console.error('FAIL: load failure row must carry a retry button'); process.exit(1)
   }
   if (!findByClass(tree, 'dsh-mp-option')) {
-    console.error('FAIL: cached groups must stay visible under the load failure'); process.exit(1)
+    console.error('FAIL: loaded groups must stay visible under the load failure'); process.exit(1)
   }
-  console.log('PASS catalog load failure renders the alert row over the cached list')
-}
-
-// --- Dirty localStorage payloads fall back silently ---
-// readStorage must reject: unparsable JSON, a version mismatch, and an empty
-// group list — all without throwing, leaving the directory to drive the list.
-{
-  const dirtyCases = [
-    ['unparsable JSON', 'not json'],
-    ['version mismatch', JSON.stringify({ v: 2, at: 1, groups: [{ id: 'p9', name: 'X', models: [{ id: 'm9', name: 'y' }] }] })],
-    ['empty group list', JSON.stringify({ v: 1, at: 1, groups: [] })],
-  ]
-  for (const [label, raw] of dirtyCases) {
-    setup()
-    globalThis.localStorage = { getItem: () => raw, setItem: () => {}, removeItem: () => {} }
-    const reg = { value: null }
-    const ctx = makeCtx(reg)
-    const mod = loadClient(['models', '', null, null, null, -1])
-    mod.apply(ctx)
-    const face = reg.value.opts.inject('sess-1')
-    if (face.catalog === null) {
-      console.error('FAIL (' + label + '): the catalog store should still exist'); process.exit(1)
-    }
-    const snapshot = face.catalog.getSnapshot()
-    if (snapshot.groups.length !== 0 || snapshot.status !== 'idle') {
-      console.error('FAIL (' + label + '): a rejected cache must not hydrate the catalog'); process.exit(1)
-    }
-    let tree
-    try {
-      tree = reg.value.Component({ locked: false, ...face })
-    } catch (e) {
-      console.error('FAIL (' + label + '): render threw on a rejected cache: ' + String((e && e.stack) || e))
-      process.exit(1)
-    }
-    if (findAllByClass(tree, 'dsh-mp-provider').length !== 2 || !findByClass(tree, 'dsh-mp-option')) {
-      console.error('FAIL (' + label + '): the directory snapshot should drive the list'); process.exit(1)
-    }
-  }
-  console.log('PASS dirty localStorage payloads fall back to the directory silently')
-}
-
-// --- Dirty RPC payload is cleaned before rendering ---
-// cleanGroups drops groups without a string name / models array and models
-// without a string name; non-string descriptions normalize to undefined.
-{
-  setup()
-  const dirty = {
-    groups: [
-      { id: 'p1', name: 'Good', models: [{ id: 'm1', name: 'ok-model' }, { id: 'm2' }, 'junk', null] },
-      { id: 'px' }, // no models array -> dropped
-      'garbage',
-      { id: 'p2', name: 42, models: [] }, // non-string name -> dropped
-      { id: 'p3', name: 'AlsoGood', models: [{ id: 'm3', name: 'fine-model', description: 7 }] },
-    ],
-    failures: 'nope', // non-array -> []
-  }
-  const emptyDir = {
-    subscribe: () => () => {},
-    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
-  }
-  const reg = { value: null }
-  const ctx = makeCtx(reg, emptyDir, {
-    connection: { api: { llm: { models: () => Promise.resolve(dirty) } } },
-  })
-  const mod = loadClient(['models', '', null, null, null, -1])
-  mod.apply(ctx)
-  const face = reg.value.opts.inject('sess-1')
-  await face.catalog.load()
-  const snapshot = face.catalog.getSnapshot()
-  if (JSON.stringify(snapshot.groups.map((g) => g.id)) !== '["p1","p3"]'
-    || snapshot.groups[0].models.length !== 1 || snapshot.groups[0].models[0].id !== 'm1'
-    || snapshot.groups[1].models[0].description !== undefined
-    || snapshot.failures.length !== 0) {
-    console.error('FAIL: catalog snapshot was not cleaned: ' + JSON.stringify(snapshot)); process.exit(1)
-  }
-  let tree
-  try {
-    tree = reg.value.Component({ locked: false, ...face })
-  } catch (e) {
-    console.error('FAIL: render threw on the dirty payload: ' + String((e && e.stack) || e)); process.exit(1)
-  }
-  if (findAllByClass(tree, 'dsh-mp-provider').length !== 2) {
-    console.error('FAIL: only the two well-formed provider groups should render'); process.exit(1)
-  }
-  const options = findAllByClass(tree, 'dsh-mp-option')
-  if (options.length !== 1 || !textOf(options[0]).includes('ok-model')) {
-    console.error('FAIL: only the well-formed model of the first group should render'); process.exit(1)
-  }
-  if (findByClass(tree, 'dsh-mp-description')) {
-    console.error('FAIL: a model without a description must not render the description row'); process.exit(1)
-  }
-  console.log('PASS dirty RPC payload is cleaned before rendering')
-}
-
-// --- Legacy host fallback: no llm.models RPC -> the directory drives the panel ---
-{
-  setup()
-  const reg = { value: null }
-  const ctx = makeCtx(reg, dirStore, { connection: undefined })
-  const mod = loadClient(['models', '', null, null, null, -1])
-  mod.apply(ctx)
-  const face = reg.value.opts.inject('sess-1')
-  if (face.available !== true || face.catalog !== null) {
-    console.error('FAIL: legacy host should stay available with a null catalog'); process.exit(1)
-  }
-  const tree = reg.value.Component({ locked: false, ...face })
-  if (findAllByClass(tree, 'dsh-mp-provider').length !== 2 || !findByClass(tree, 'dsh-mp-option')) {
-    console.error('FAIL: legacy host should render from the directory snapshot'); process.exit(1)
-  }
-  console.log('PASS legacy host without llm.models falls back to the directory snapshot')
+  console.log('PASS refresh failure keeps the loaded list and renders the alert row')
 }
 
 // --- Subagent sessions hide the picker ---
@@ -1693,8 +1361,8 @@ function loadClient(stateQueue, setCalls) {
 }
 
 // --- Trigger label falls back to the current model id when the list lacks it ---
-// A stale/partial catalog can miss the current model; the trigger must show
-// the model id rather than the "select model" placeholder.
+// A stale/partial directory list can miss the current model; the trigger must
+// show the model id rather than the "select model" placeholder.
 {
   setup()
   const staleDir = {
@@ -1720,43 +1388,6 @@ function loadClient(stateQueue, setCalls) {
       + JSON.stringify(label && textOf(label))); process.exit(1)
   }
   console.log('PASS trigger label falls back to the current model id')
-}
-
-// --- Dirty RPC failures are cleaned before rendering ---
-// cleanFailures drops non-object entries and entries without a string name,
-// defaults a missing id to the name (React key), and normalizes a non-string
-// message to ''.
-{
-  setup()
-  const dirty = {
-    groups: [{ id: 'p1', name: 'Good', models: [{ id: 'm1', name: 'ok-model' }] }],
-    failures: ['junk', null, { name: 'Broken' }, { id: 'p3', name: 'Bad', message: 42 }],
-  }
-  const emptyDir = {
-    subscribe: () => () => {},
-    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
-  }
-  const reg = { value: null }
-  const ctx = makeCtx(reg, emptyDir, {
-    connection: { api: { llm: { models: () => Promise.resolve(dirty) } } },
-  })
-  const mod = loadClient(['models', '', null, null, null, -1])
-  mod.apply(ctx)
-  const face = reg.value.opts.inject('sess-1')
-  await face.catalog.load()
-  const snapshot = face.catalog.getSnapshot()
-  if (snapshot.failures.length !== 2 || snapshot.failures[0].id !== 'Broken'
-    || snapshot.failures[0].message !== '' || snapshot.failures[1].id !== 'p3'
-    || snapshot.failures[1].message !== '') {
-    console.error('FAIL: catalog failures were not cleaned: ' + JSON.stringify(snapshot.failures)); process.exit(1)
-  }
-  const tree = reg.value.Component({ locked: false, ...face })
-  const warnings = findAllByClass(tree, 'dsh-mp-warning')
-  if (warnings.length !== 2 || textOf(warnings[0]) !== 'Broken 加载失败：重试'
-    || textOf(warnings[1]) !== 'Bad 加载失败：重试') {
-    console.error('FAIL: cleaned failure rows mismatch: ' + JSON.stringify(warnings.map(textOf))); process.exit(1)
-  }
-  console.log('PASS dirty RPC failures are cleaned before rendering')
 }
 
 // --- Non-object reasoning blocks never crash the render (directory path) ---
@@ -1898,40 +1529,11 @@ function loadClient(stateQueue, setCalls) {
   console.log('PASS choosing a model with a non-object reasoning block attaches no reasoningEffort')
 }
 
-// --- A non-string defaultEffort is normalized away on both data paths ---
-// cleanReasoning covers the catalog path; the never-cleaned directory path is
-// guarded inside the component (menu row + trigger label) and on the click
-// path (the RPC payload). defaultEffort: 42 must behave as "no default".
+// --- A non-string defaultEffort is normalized away on render and on click ---
+// The directory snapshot is host data that never passes through a cleaner, so
+// the component itself guards it: defaultEffort: 42 must behave as "no
+// default" on the menu row, the trigger label, and the select payload.
 {
-  // Catalog path: the snapshot itself is normalized.
-  {
-    setup()
-    const dirty = {
-      groups: [{
-        id: 'p1',
-        name: 'DeepSeek',
-        models: [{ id: 'm1', name: 'm1', reasoning: { efforts: [{ id: 'low', name: 'Low' }], defaultEffort: 42 } }],
-      }],
-      failures: [],
-    }
-    const emptyDir = {
-      subscribe: () => () => {},
-      getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
-    }
-    const reg = { value: null }
-    const ctx = makeCtx(reg, emptyDir, {
-      connection: { api: { llm: { models: () => Promise.resolve(dirty) } } },
-    })
-    const mod = loadClient(['models', '', null, null, null, -1])
-    mod.apply(ctx)
-    const face = reg.value.opts.inject('sess-1')
-    await face.catalog.load()
-    const reasoning = face.catalog.getSnapshot().groups[0].models[0].reasoning
-    if (!reasoning || reasoning.defaultEffort !== undefined || reasoning.efforts.length !== 1) {
-      console.error('FAIL: a non-string defaultEffort must normalize to undefined: ' + JSON.stringify(reasoning))
-      process.exit(1)
-    }
-  }
   // Directory path: the effort menu keeps the provider-default row and the
   // trigger reads provider default, as if no defaultEffort were declared.
   {
@@ -2017,71 +1619,7 @@ function loadClient(stateQueue, setCalls) {
         + JSON.stringify(selections)); process.exit(1)
     }
   }
-  console.log('PASS a non-string defaultEffort is normalized away on both data paths')
-}
-
-// --- Dirty reasoning blocks and id-less entries are cleaned on the catalog path ---
-// cleanReasoning normalizes a non-object block to undefined and drops effort
-// entries without a string id/name; cleanGroups drops groups/models without a
-// string id (they cannot be keyed, tabbed, or selected).
-{
-  setup()
-  const dirty = {
-    groups: [
-      {
-        id: 'p1',
-        name: 'DeepSeek',
-        models: [
-          { id: 'm1', name: 'deepseek-v4-flash', reasoning: null },
-          { id: 'm2', name: 'deepseek-v4-pro', reasoning: { efforts: [null, 'junk', { id: 'low' }, { id: 'max', name: 'Max' }] } },
-          { name: 'id-less-model' }, // no id -> dropped
-        ],
-      },
-      { name: 'NoId', models: [{ id: 'mx', name: 'ghost' }] }, // no id -> dropped
-    ],
-    failures: [],
-  }
-  const emptyDir = {
-    subscribe: () => () => {},
-    getSnapshot: () => ({ current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }),
-  }
-  const reg = { value: null }
-  const ctx = makeCtx(reg, emptyDir, {
-    connection: { api: { llm: { models: () => Promise.resolve(dirty) } } },
-  })
-  const mod = loadClient(['models', '', null, null, null, -1])
-  mod.apply(ctx)
-  const face = reg.value.opts.inject('sess-1')
-  await face.catalog.load()
-  const snapshot = face.catalog.getSnapshot()
-  if (snapshot.groups.length !== 1 || snapshot.groups[0].id !== 'p1') {
-    console.error('FAIL: the id-less group must be dropped: ' + JSON.stringify(snapshot.groups)); process.exit(1)
-  }
-  if (snapshot.groups[0].models.length !== 2) {
-    console.error('FAIL: the id-less model must be dropped: ' + JSON.stringify(snapshot.groups[0].models)); process.exit(1)
-  }
-  const [m1, m2] = snapshot.groups[0].models
-  if (m1.reasoning !== undefined) {
-    console.error('FAIL: a null reasoning block must normalize to undefined, got ' + JSON.stringify(m1.reasoning))
-    process.exit(1)
-  }
-  if (!m2.reasoning || !Array.isArray(m2.reasoning.efforts) || m2.reasoning.efforts.length !== 1
-    || m2.reasoning.efforts[0].id !== 'max') {
-    console.error('FAIL: dirty effort entries must be dropped: ' + JSON.stringify(m2.reasoning)); process.exit(1)
-  }
-  let tree
-  try {
-    tree = reg.value.Component({ locked: false, ...face })
-  } catch (e) {
-    console.error('FAIL: render threw on dirty reasoning blocks: ' + String((e && e.stack) || e)); process.exit(1)
-  }
-  if (findAllByClass(tree, 'dsh-mp-provider').length !== 1) {
-    console.error('FAIL: only the well-formed provider group should render'); process.exit(1)
-  }
-  if (findAllByClass(tree, 'dsh-mp-option').length !== 2) {
-    console.error('FAIL: only the two well-formed models should render'); process.exit(1)
-  }
-  console.log('PASS dirty reasoning blocks and id-less entries are cleaned on the catalog path')
+  console.log('PASS a non-string defaultEffort is normalized away on render and on click')
 }
 
 // --- Failed select with an undefined directory error shows the generic notice ---
@@ -2224,286 +1762,4 @@ function loadClient(stateQueue, setCalls) {
     console.error('FAIL: an empty efforts array must not render the effort menu'); process.exit(1)
   }
   console.log('PASS empty efforts array hides the effort trigger (no provider-default-only no-op menu)')
-}
-
-// --- Per-session selection memory: replayed once per host generation ---
-// The host restores a session's model/effort from the session log's last
-// request header on restart, so a pick made after the session's last request
-// silently reverts. The panel remembers the settled selection per session in
-// localStorage and replays it when the host-restored snapshot diverges.
-{
-  const SELECTIONS_KEY = 'dsh-model-picker:selections:v1'
-  const REASONED_GROUPS = [
-    {
-      id: 'p1',
-      name: 'DeepSeek',
-      models: [{
-        id: 'm1',
-        name: 'deepseek-v4-pro',
-        reasoning: { efforts: [{ id: 'off', name: 'Off' }, { id: 'max', name: 'Max' }] },
-      }],
-    },
-  ]
-  const LOADING = { current: null, routable: null, groups: [], failures: [], status: 'loading', error: null }
-  const IDLE = { current: null, routable: null, groups: [], failures: [], status: 'idle', error: null }
-
-  // A directory store the block can drive by hand: emit() swaps the snapshot
-  // and notifies the subscribers the component registered through its effect.
-  function makeControllableStore(initial) {
-    let snap = initial
-    const listeners = new Set()
-    return {
-      subscribe: (fn) => { listeners.add(fn); return () => { listeners.delete(fn) } },
-      getSnapshot: () => snap,
-      emit: (next) => { snap = next; for (const fn of listeners) fn() },
-    }
-  }
-
-  // Same wiring as makeCtx but with select() recorded into `selections` and
-  // ctx.on handlers captured into onHandlers (connection/reset drives the
-  // host-generation gate).
-  function makeMemoryCtx(reg, store, selections, onHandlers) {
-    return {
-      get(name) {
-        if (name === 'slots') {
-          return {
-            inject(key, cb) { if (key === 'conversation.input.model') reg.value = cb() },
-            register(opts, Component) { return { opts, Component } },
-          }
-        }
-        if (name === 'connection') return { api: { llm: { models: () => new Promise(() => {}) } } }
-        if (name === 'remote') return { $on: () => {} }
-        if (name === 'modelDirectories') {
-          return {
-            directoryFor: () => ({
-              store,
-              load: () => {},
-              select: (s) => { selections.push(s); return Promise.resolve() },
-            }),
-          }
-        }
-        if (name === 'sessions') return { subagentAddress: () => undefined }
-        return undefined
-      },
-      effect(fn) { return fn() },
-      on(event, fn) { (onHandlers[event] = onHandlers[event] ?? []).push(fn) },
-    }
-  }
-
-  const mockSelectionsStorage = (stored, writes) => {
-    globalThis.localStorage = {
-      getItem: (key) => (key === SELECTIONS_KEY && stored !== undefined ? JSON.stringify(stored) : null),
-      setItem: (k, v) => { if (writes) writes.push([k, v]) },
-      removeItem: () => {},
-    }
-  }
-
-  // A) Host restart restores a stale selection: the remembered effort replays
-  //    on the loading -> ready edge.
-  {
-    setup()
-    mockSelectionsStorage({ v: 1, sessions: { 'sess-1': { provider: 'p1', model: 'm1', effort: 'max', at: Date.now() } } })
-    const restored = {
-      current: { provider: 'p1', model: 'm1' }, // stale: the header predates the effort pick
-      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
-    }
-    const store = makeControllableStore(LOADING)
-    const selections = []
-    const reg = { value: null }
-    const ctx = makeMemoryCtx(reg, store, selections, {})
-    const mod = loadClient(null)
-    mod.apply(ctx)
-    const face = reg.value.opts.inject('sess-1')
-    reg.value.Component({ locked: false, ...face })
-    store.emit(restored)
-    if (selections.length !== 1 || selections[0].provider !== 'p1' || selections[0].model !== 'm1'
-      || selections[0].reasoningEffort !== 'max') {
-      console.error('FAIL: the remembered selection should replay on the ready edge: ' + JSON.stringify(selections))
-      process.exit(1)
-    }
-    console.log('PASS host-restored stale selection is replayed from the per-session memory')
-  }
-
-  // B) No record: nothing replays, and a repeated ready cycle stays quiet
-  //    (the directory is marked reconciled for this host generation).
-  {
-    setup()
-    mockSelectionsStorage(undefined)
-    const restored = {
-      current: { provider: 'p1', model: 'm1' },
-      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
-    }
-    const store = makeControllableStore(LOADING)
-    const selections = []
-    const reg = { value: null }
-    const ctx = makeMemoryCtx(reg, store, selections, {})
-    const mod = loadClient(null)
-    mod.apply(ctx)
-    const face = reg.value.opts.inject('sess-1')
-    reg.value.Component({ locked: false, ...face })
-    store.emit(restored)
-    store.emit(IDLE)
-    store.emit(restored)
-    if (selections.length !== 0) {
-      console.error('FAIL: without a record nothing may replay, got ' + JSON.stringify(selections)); process.exit(1)
-    }
-    console.log('PASS no record -> no replay, repeated ready cycles stay quiet')
-  }
-
-  // C) The restored snapshot already matches the record: nothing to do.
-  {
-    setup()
-    mockSelectionsStorage({ v: 1, sessions: { 'sess-1': { provider: 'p1', model: 'm1', effort: 'max', at: Date.now() } } })
-    const restored = {
-      current: { provider: 'p1', model: 'm1', reasoningEffort: 'max' },
-      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
-    }
-    const store = makeControllableStore(LOADING)
-    const selections = []
-    const reg = { value: null }
-    const ctx = makeMemoryCtx(reg, store, selections, {})
-    const mod = loadClient(null)
-    mod.apply(ctx)
-    const face = reg.value.opts.inject('sess-1')
-    reg.value.Component({ locked: false, ...face })
-    store.emit(restored)
-    if (selections.length !== 0) {
-      console.error('FAIL: a matching restored selection must not replay: ' + JSON.stringify(selections)); process.exit(1)
-    }
-    console.log('PASS restored selection matching the record is left alone')
-  }
-
-  // D) The selecting -> ready edge persists the settled (resolved) selection.
-  {
-    setup()
-    const writes = []
-    mockSelectionsStorage(undefined, writes)
-    const groups = [{
-      id: 'p1',
-      name: 'DeepSeek',
-      models: [
-        { id: 'm1', name: 'deepseek-v4-flash' },
-        { id: 'm2', name: 'deepseek-v4-pro', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }] } },
-      ],
-    }]
-    const selecting = {
-      current: { provider: 'p1', model: 'm1' },
-      routable: true, groups, failures: [], status: 'selecting', error: null,
-    }
-    const settled = {
-      current: { provider: 'p1', model: 'm2', reasoningEffort: 'high' },
-      routable: true, groups, failures: [], status: 'ready', error: null,
-    }
-    const store = makeControllableStore(selecting)
-    const selections = []
-    const reg = { value: null }
-    const ctx = makeMemoryCtx(reg, store, selections, {})
-    const mod = loadClient(null)
-    mod.apply(ctx)
-    const face = reg.value.opts.inject('sess-1')
-    reg.value.Component({ locked: false, ...face })
-    store.emit(settled)
-    const write = writes.find(([key]) => key === SELECTIONS_KEY)
-    if (!write) { console.error('FAIL: the settled selection must be persisted'); process.exit(1) }
-    const record = JSON.parse(write[1]).sessions?.['sess-1']
-    if (!record || record.provider !== 'p1' || record.model !== 'm2' || record.effort !== 'high'
-      || typeof record.at !== 'number') {
-      console.error('FAIL: persisted record mismatch: ' + JSON.stringify(record)); process.exit(1)
-    }
-    if (selections.length !== 0) {
-      console.error('FAIL: the settle edge must persist, not replay: ' + JSON.stringify(selections)); process.exit(1)
-    }
-    console.log('PASS a settled select persists the resolved selection per session')
-  }
-
-  // E) The remembered model vanished from the catalog: skip the replay (a
-  //    rejected select would latch an error status onto the panel).
-  {
-    setup()
-    const writes = []
-    mockSelectionsStorage({ v: 1, sessions: { 'sess-1': { provider: 'p9', model: 'gone', effort: null, at: Date.now() } } }, writes)
-    const restored = {
-      current: { provider: 'p1', model: 'm1' },
-      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
-    }
-    const store = makeControllableStore(LOADING)
-    const selections = []
-    const reg = { value: null }
-    const ctx = makeMemoryCtx(reg, store, selections, {})
-    const mod = loadClient(null)
-    mod.apply(ctx)
-    const face = reg.value.opts.inject('sess-1')
-    reg.value.Component({ locked: false, ...face })
-    store.emit(restored)
-    if (selections.length !== 0) {
-      console.error('FAIL: a vanished model must not replay: ' + JSON.stringify(selections)); process.exit(1)
-    }
-    if (writes.some(([key]) => key === SELECTIONS_KEY)) {
-      console.error('FAIL: a skipped replay must not touch the stored selections'); process.exit(1)
-    }
-    console.log('PASS a record whose model left the catalog is skipped without a write')
-  }
-
-  // F) The generation gate: one replay per host generation; connection/reset
-  //    re-arms the reconcile for the post-restart restore.
-  {
-    setup()
-    mockSelectionsStorage({ v: 1, sessions: { 'sess-1': { provider: 'p1', model: 'm1', effort: 'max', at: Date.now() } } })
-    const restored = {
-      current: { provider: 'p1', model: 'm1' },
-      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
-    }
-    // Mount straight into the restored snapshot: the catch-up reconcile fires.
-    const store = makeControllableStore(restored)
-    const selections = []
-    const onHandlers = {}
-    const reg = { value: null }
-    const ctx = makeMemoryCtx(reg, store, selections, onHandlers)
-    const mod = loadClient(null)
-    mod.apply(ctx)
-    const face = reg.value.opts.inject('sess-1')
-    reg.value.Component({ locked: false, ...face })
-    if (selections.length !== 1) {
-      console.error('FAIL: the mount-time catch-up should replay once, got ' + selections.length); process.exit(1)
-    }
-    store.emit(IDLE)
-    store.emit(restored)
-    if (selections.length !== 1) {
-      console.error('FAIL: the same generation must not replay twice: ' + JSON.stringify(selections)); process.exit(1)
-    }
-    // Host restart: both the catalog refresh and the generation bump listen.
-    for (const fn of onHandlers['connection/reset'] ?? []) fn()
-    store.emit(IDLE)
-    store.emit(restored)
-    if (selections.length !== 2 || selections[1].provider !== 'p1' || selections[1].model !== 'm1'
-      || selections[1].reasoningEffort !== 'max') {
-      console.error('FAIL: a new host generation should re-arm the replay: ' + JSON.stringify(selections)); process.exit(1)
-    }
-    console.log('PASS the replay is gated per host generation and re-armed by connection/reset')
-  }
-
-  // G) An explicit provider-default record (effort null) replays WITHOUT the
-  //    reasoningEffort key, clearing a stale restored effort.
-  {
-    setup()
-    mockSelectionsStorage({ v: 1, sessions: { 'sess-1': { provider: 'p1', model: 'm1', effort: null, at: Date.now() } } })
-    const restored = {
-      current: { provider: 'p1', model: 'm1', reasoningEffort: 'low' },
-      routable: true, groups: REASONED_GROUPS, failures: [], status: 'ready', error: null,
-    }
-    const store = makeControllableStore(LOADING)
-    const selections = []
-    const reg = { value: null }
-    const ctx = makeMemoryCtx(reg, store, selections, {})
-    const mod = loadClient(null)
-    mod.apply(ctx)
-    const face = reg.value.opts.inject('sess-1')
-    reg.value.Component({ locked: false, ...face })
-    store.emit(restored)
-    if (selections.length !== 1 || selections[0].provider !== 'p1' || selections[0].model !== 'm1'
-      || 'reasoningEffort' in selections[0]) {
-      console.error('FAIL: provider-default replay must omit reasoningEffort: ' + JSON.stringify(selections)); process.exit(1)
-    }
-    console.log('PASS an explicit provider-default record replays without the reasoningEffort key')
-  }
 }
